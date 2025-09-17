@@ -2490,7 +2490,18 @@ function updatePreviewDomain() {
   if (ideal >= POP_COMPLETE_R) {
     if (popCompleteTime===0) popCompleteTime = millis();
     else if (millis()-popCompleteTime > POP_TO_DOMAIN_DELAY) {
-      let newDom = (previewDomain.type==='lonepair') ? new LonePair(previewDomain.pos.copy()) : new Bond(previewDomain.pos.copy());
+let newDom;
+if (previewDomain.type === 'lonepair') {
+  newDom = new LonePair(previewDomain.pos.copy());
+} else {
+  // xác định order từ loại preview (single/double/triple)
+  let order = 1;
+  if (previewDomain.type === 'double') order = 2;
+  else if (previewDomain.type === 'triple') order = 3;
+  // allow previewDomain.element if set, else default 'X'
+  let element = previewDomain.element || 'X';
+  newDom = new Bond(previewDomain.pos.copy(), element, order);
+}
       newDom.tangentOffset = previewDomain.tangentOffset ? previewDomain.tangentOffset.copy() : createVector(0,0,0);
       newDom.tangentAmp = previewDomain.tangentAmp || newDom.tangentAmp;
       newDom.noiseSeed = previewDomain.noiseSeed || newDom.noiseSeed;
@@ -2566,9 +2577,34 @@ function updateDomainListUI() {
     let row = createDiv(); row.parent(domainListPanel);
     row.style('display','flex'); row.style('align-items','center'); row.style('justify-content','space-between'); row.style('margin-bottom','6px');
     let left = createDiv(); left.parent(row); left.style('display','flex'); left.style('align-items','center'); left.style('gap','6px');
-    let iconHtml = '';
-    if (dom.type === 'bond') iconHtml = `<svg width="30" height="4" viewBox="0 0 30 4"><line x1="0" y1="2" x2="30" y2="2" stroke="white" stroke-width="0.6"/></svg>`;
-    else if (dom.type === 'lonepair') iconHtml = `<svg width="30" height="20" viewBox="0 0 30 20"><path d="M 0 10 Q 4 -5 20 5 C 26 10 20 15 20 15 Q 4 25 0 10 Z" fill="rgba(255,255,255,0.2)"/><circle cx="10" cy="7" r="1.6" fill="white"/><circle cx="10" cy="13" r="1.6" fill="white"/></svg>`;
+let iconHtml = '';
+if (dom.type === 'bond') {
+  // Hiển thị biểu tượng theo thứ tự liên kết (order)
+  if (dom.order === 2) {
+    // double bond: hai gạch song song
+    iconHtml = `
+      <svg width="30" height="10" viewBox="0 0 40 10" xmlns="http://www.w3.org/2000/svg">
+        <line x1="0" y1="3" x2="40" y2="3" stroke="white" stroke-width="0.9" stroke-linecap="round"/>
+        <line x1="0" y1="7" x2="40" y2="7" stroke="white" stroke-width="0.9" stroke-linecap="round"/>
+      </svg>`;
+  } else if (dom.order === 3) {
+    // triple bond: ba gạch song song
+    iconHtml = `
+      <svg width="30" height="14" viewBox="0 0 40 14" xmlns="http://www.w3.org/2000/svg">
+        <line x1="0" y1="3" x2="40" y2="3" stroke="white" stroke-width="0.9" stroke-linecap="round"/>
+        <line x1="0" y1="7" x2="40" y2="7" stroke="white" stroke-width="0.9" stroke-linecap="round"/>
+        <line x1="0" y1="11" x2="40" y2="11" stroke="white" stroke-width="0.9" stroke-linecap="round"/>
+      </svg>`;
+  } else {
+    // single bond: một gạch
+    iconHtml = `
+      <svg width="30" height="6" viewBox="0 0 40 6" xmlns="http://www.w3.org/2000/svg">
+        <line x1="0" y1="3" x2="40" y2="3" stroke="white" stroke-width="0.9" stroke-linecap="round"/>
+      </svg>`;
+  }
+} else if (dom.type === 'lonepair') {
+  iconHtml = `<svg width="30" height="20" viewBox="0 0 30 20"><path d="M 0 10 Q 4 -5 20 5 C 26 10 20 15 20 15 Q 4 25 0 10 Z" fill="rgba(255,255,255,0.2)"/><circle cx="10" cy="7" r="1.6" fill="white"/><circle cx="10" cy="13" r="1.6" fill="white"/></svg>`;
+}
     let icon = createDiv(iconHtml); icon.parent(left); icon.elt.style.pointerEvents = 'none';
     let label = createDiv(`#${dom.id} (${dom.type}${dom.element ? ' ' + dom.element : ''}${dom.order ? ' x' + dom.order : ''})`); label.parent(left); label.style('font-size','12px'); label.style('color','white');
     let removeBtn = createButton('x'); removeBtn.parent(row); removeBtn.style('background','red'); removeBtn.style('color','white');
