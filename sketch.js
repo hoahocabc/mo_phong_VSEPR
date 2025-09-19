@@ -231,11 +231,19 @@ const I18N = {
     notes: 'Ghi chú',
     topLabel: 'MÔ PHỎNG VSEPR',
     notesContent: `* Trong công thức AXₙEₘ: 
-     A: Nguyên tử trung tâm. 
-     X: Nguyên tử liên kết – đại diện cho các nguyên tử gắn với nguyên tử trung tâm bằng liên kết cộng hóa trị. 
-     n: Số nguyên tử X liên kết với A.
-     E: Cặp electron tự do trên nguyên tử trung tâm. 
-     m: Số cặp electron tự do trên nguyên tử trung tâm. 
+          A: Nguyên tử trung tâm. 
+          X: Nguyên tử liên kết – đại diện cho các nguyên tử gắn với nguyên tử trung tâm bằng liên kết cộng hóa trị. 
+          n: Số nguyên tử X liên kết với A.
+          E: Cặp electron tự do trên nguyên tử trung tâm. 
+          m: Số cặp electron tự do trên nguyên tử trung tâm. 
+   AX₂: Dạng thẳng.
+   AX₃: Dạng tam giác phẳng.
+   AX₂E, AX₂E₂: Dạng góc.
+   AX₃E: Dạng tháp tam giác.
+   AX₄: Dạng tứ diện.
+   AX₅, AX₄E, AX₃E₂, AX₂E₃: Dạng lưỡng tháp tam giác.
+   AX₆, AX₅E, AX₄E₂: Dạng bát diện.
+   AX₇: Dạng lưỡng tháp ngũ giác.
 
 * Nguồn dữ liệu cấu trúc và góc liên kết thực nghiệm chủ yếu lấy từ NIST CCCBDB / NIST Chemistry WebBook (trang chuẩn cho dữ liệu hình học, phổ, hằng số phân tử). Một số tổng quan/hướng dẫn (giải thích VSEPR, độ lệch do cặp electron tự do, mô tả cấu trúc interhalogen) được trích từ tài liệu chuyên ngành/tổng quan học thuật khi NIST không đưa con số tóm tắt trong trang truy vấn nhanh. 
 
@@ -251,11 +259,19 @@ const I18N = {
     notes: 'Notes',
     topLabel: 'VSEPR SIMULATION',
     notesContent: `* In the formula AXₙEₘ:
-     A: Central atom.
-     X: Bonded atom – representing atoms attached to the central atom via covalent bonds.
-     n: Number of X atoms bonded to A.
-     E: Lone pair(s) of electrons on the central atom.
-     m: Number of lone pairs on the central atom.
+          A: Central atom.
+          X: Bonded atom – representing atoms attached to the central atom via covalent bonds.
+          n: Number of X atoms bonded to A.
+          E: Lone pair(s) of electrons on the central atom.
+          m: Number of lone pairs on the central atom.
+   AX₂: Linear.
+   AX₃: Trigonal planar.
+   AX₂E, AX₂E₂: Bent (angular).
+   AX₃E: Trigonal pyramidal.
+   AX₄: Tetrahedral.
+   AX₅, AX₄E, AX₃E₂, AX₂E₃: Trigonal bipyramidal.
+   AX₆, AX₅E, AX₄E₂: Octahedral.
+   AX₇: Pentagonal bipyramidal.
 
 * Sources of experimental structures and bond angles are primarily taken from NIST CCCBDB / NIST Chemistry WebBook (standard references for molecular geometry, spectra, and molecular constants). Some reviews/guides (explaining VSEPR, deviations due to lone pairs, descriptions of interhalogen structures) are taken from specialized or academic overview materials when NIST does not provide summarized values in the quick query pages.
 
