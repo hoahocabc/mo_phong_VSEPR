@@ -1,7 +1,16 @@
 // main.js
-// VSEPR visualizer - Full code with smoother animations, canonical VSEPR assignment for simulated molecules,
-// when "Show angles" is turned on the scene smoothly orients so the fan plane is perpendicular to the view (fan faces the user).
-// This is the complete main.js.
+// VSEPR visualizer - Full code.
+// Behavior:
+// - Preset molecules (real molecule presets) keep the previous fan-radius allocation logic (uses nearest available grid slot).
+// - Simulated molecules (user-constructed by adding domains to the red central sphere) use a deterministic descending allocation:
+//     anchor = rounded nearest 20px grid to the largest requested radius, then allocated radii = anchor, anchor-20, anchor-40, ...
+//     this guarantees all fans in a simulation are distinct and separated by at least 20px.
+// - Additionally, for simulated molecules, if there are multiple equal angles with the same role-type (e.g., eq-eq, ax-ax, ax-eq),
+//   only one representative fan is shown per group (the representative is chosen by largest chord distance).
+// - Labels always face the camera upright (undo scene rotations in the inverse order).
+// - Orientation animation (orientActive) temporarily suspends auto-rotate if it was active, but the angle overlay and auto-rotate toggles are independent:
+//   toggling the angle overlay no longer force-changes the user's auto-rotate preference. User interactions cancel orientActive and
+//   restore auto-rotate only if it was suspended by the orientation routine.
 
 let arialFont = null;
 let p5Canvas = null;
@@ -46,6 +55,23 @@ function safeLerpVec(a, b, t) {
   b = sanitizeVec(b, createVector(0,0,0));
   return p5.Vector.lerp(a, b, t);
 }
+
+/////////////////////// Performance / Quality adaptive settings ///////////////////////
+// Detect mobile/low-power devices to reduce rendering work.
+let isMobileDevice = (typeof navigator !== 'undefined' && /Mobi|Android|iPhone|iPad|iPod|Windows Phone/i.test(navigator.userAgent))
+  || (typeof window !== 'undefined' && ('ontouchstart' in window) && (navigator.maxTouchPoints && navigator.maxTouchPoints > 1));
+
+// Quality knobs (adapted automatically)
+let PIXEL_DENSITY = isMobileDevice ? 1 : Math.min(window.devicePixelRatio || 1, 2);
+let SPHERE_DETAIL = isMobileDevice ? 6 : 12; // lower subdivision for spheres on mobile
+let ANGLE_STEPS = isMobileDevice ? 18 : 36;  // fewer segments when rendering fans on mobile
+let REPULSION_SKIP_FRAMES = isMobileDevice ? 2 : 1; // run repulsion every N frames on low-power devices
+let UI_UPDATE_INTERVAL = isMobileDevice ? 300 : 80; // throttle UI DOM updates (ms)
+let INITIAL_RELAX_ITERS = isMobileDevice ? 3 : 6; // initial relax iterations
+let RENDER_ANGLE_LABELS = !isMobileDevice; // skip angle labels on many mobiles to save layout work
+
+let repulsionFrameCounter = 0;
+let lastUIUpdateTime = 0;
 
 /////////////////////// Utility: client <-> world coordinate conversion ///////////////////////
 function clientToWorld(clientX, clientY) {
@@ -186,6 +212,7 @@ let domainListPanel;
 let camX = 0, camY = 0, camZ = 1200;
 let zoom = 1.0;
 let rotationX = 0, rotationY = 0;
+let rotationZ = 0; // roll
 
 let isVSEPRMode = false;
 let isSyncing = false;
@@ -282,11 +309,12 @@ const I18N = {
 let initialRuntimeState = null;
 
 /////////////////////// Orientation-to-fan animation state ///////////////////////
-let orientStartRotX = 0, orientStartRotY = 0;
-let orientTargetRotX = 0, orientTargetRotY = 0;
+let orientStartRotX = 0, orientStartRotY = 0, orientStartRotZ = 0;
+let orientTargetRotX = 0, orientTargetRotY = 0, orientTargetRotZ = 0;
 let orientStartTime = 0, orientDuration = 700;
 let orientActive = false;
-let savedAutoRotate = false;
+// New flag: track if autoRotate was suspended by orient animation so we can restore it only if we suspended it.
+let autoRotateSuspendedDuringOrient = false;
 
 /////////////////////// Molecule presets ///////////////////////
 const MOLECULES = {
@@ -386,6 +414,86 @@ function angleBetweenVectors(a, b) {
   let nb = safeNormalize(b, createVector(1,0,0));
   let c = constrain(na.dot(nb), -1, 1);
   return acos(c);
+}
+
+/////////////////////// UNIQUE-FAN RADIUS HELPERS (grid-based nearest-slot) ///////////////////////
+// This is used by preset molecules (kept as earlier behavior): it finds the nearest grid slot
+// to the requested base radius that does not conflict with already-used radii (min spacing 20px).
+function computeUniqueFanRadiusProposed(baseRadius, seedValue, usedSet) {
+  const SPACING = 20; // minimal pairwise difference in px required
+  // canonical first radius = 2/3 of bond length
+  const firstRadius = constrain((2/3) * BOND_LENGTH, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
+
+  // sanitize proposed base
+  let base = sanitizeScalar(baseRadius, firstRadius);
+  base = constrain(base, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
+
+  // Build discrete grid of candidate radii centered around firstRadius with SPACING increments,
+  // clamp into allowed bounds, then sort candidates by closeness to desired base.
+  const maxSteps = Math.ceil((FAN_MAX_RADIUS - FAN_MIN_RADIUS) / SPACING) + 6;
+  let slotSet = new Set();
+  for (let k = -maxSteps; k <= maxSteps; k++) {
+    let cand = firstRadius + k * SPACING;
+    cand = constrain(cand, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
+    slotSet.add(Number(cand.toFixed(3)));
+  }
+  // Convert to array and sort by closeness to the requested base
+  let slots = Array.from(slotSet);
+  slots.sort((a, b) => Math.abs(a - base) - Math.abs(b - base) || b - a);
+
+  // pick first slot that is at least SPACING away from all used radii
+  const EPS = 1e-6;
+  for (let cand of slots) {
+    let ok = true;
+    for (let u of usedSet) {
+      if (Math.abs(cand - u) < SPACING - EPS) { ok = false; break; }
+    }
+    if (ok) {
+      usedSet.add(cand);
+      return cand;
+    }
+  }
+
+  // If no grid slot found, fallback scanning
+  let attempts = 0;
+  let candFallback = base;
+  while (attempts < 200) {
+    let conflict = false;
+    for (let u of usedSet) {
+      if (Math.abs(candFallback - u) < SPACING - EPS) { conflict = true; break; }
+    }
+    if (!conflict) {
+      candFallback = constrain(candFallback, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
+      usedSet.add(Number(candFallback.toFixed(3)));
+      return candFallback;
+    }
+    let step = SPACING * (Math.floor(attempts/2) + 1);
+    if (attempts % 2 === 0) candFallback = base - step;
+    else candFallback = base + step;
+    if (candFallback < FAN_MIN_RADIUS) candFallback = FAN_MIN_RADIUS;
+    if (candFallback > FAN_MAX_RADIUS) candFallback = FAN_MAX_RADIUS;
+    attempts++;
+  }
+
+  // Last resort: firstRadius with tiny jitter
+  let finalCand = firstRadius;
+  let jitter = 0.0001 * Math.abs(Math.sin((seedValue || 1) * 13.37));
+  finalCand = constrain(finalCand - jitter, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
+  usedSet.add(Number(finalCand.toFixed(6)));
+  return finalCand;
+}
+
+/////////////////////// Grid helpers for deterministic descending allocation ///////////////////////
+function roundToGrid(value, spacing) {
+  if (!isFiniteNumber(value)) return value;
+  return Math.round(value / spacing) * spacing;
+}
+function clampAnchorForCount(anchorGridValue, count, spacing, minR, maxR) {
+  // Ensure sequence anchor - (count-1)*spacing >= minR
+  let minAllowedAnchor = minR + (count - 1) * spacing;
+  if (anchorGridValue < minAllowedAnchor) anchorGridValue = minAllowedAnchor;
+  if (anchorGridValue > maxR) anchorGridValue = maxR;
+  return anchorGridValue;
 }
 
 /////////////////////// assignPresetPositionsToDomains ///////////////////////
@@ -565,6 +673,9 @@ class ElectronDomain {
     if (arialFont) {
       push();
       translate(this.pos.x, this.pos.y, this.pos.z);
+      // Undo scene rotations in inverse order so labels always face camera upright:
+      // draw() applies rotateX, rotateY, rotateZ in that order, so undo with rotateZ(-), rotateY(-), rotateX(-)
+      rotateZ(-rotationZ);
       rotateY(-rotationY);
       rotateX(-rotationX);
       translate(0, -BOND_SPHERE_RADIUS - 12, 1.6);
@@ -599,9 +710,8 @@ class Bond extends ElectronDomain {
 
     push();
     stroke(220);
-    // ---------- Bond thickness HALVED ----------
     if (this.order === 1) {
-      strokeWeight(4); // was 8
+      strokeWeight(4);
       line(startAbs.x, startAbs.y, startAbs.z, endAbs.x, endAbs.y, endAbs.z);
     } else if (this.order === 2) {
       let off = 9;
@@ -609,18 +719,18 @@ class Bond extends ElectronDomain {
       let e1 = p5.Vector.add(endAbs, p5.Vector.mult(offsetDir, off));
       let s2 = p5.Vector.sub(startAbs, p5.Vector.mult(offsetDir, off));
       let e2 = p5.Vector.sub(endAbs, p5.Vector.mult(offsetDir, off));
-      strokeWeight(3); // was 6
+      strokeWeight(3);
       line(s1.x,s1.y,s1.z, e1.x,e1.y,e1.z);
       line(s2.x,s2.y,s2.z, e2.x,e2.y,e2.z);
     } else {
-      strokeWeight(3); // was 6
+      strokeWeight(3);
       line(startAbs.x, startAbs.y, startAbs.z, endAbs.x, endAbs.y, endAbs.z);
       let off = 13;
       let s1 = p5.Vector.add(startAbs, p5.Vector.mult(offsetDir, off));
       let e1 = p5.Vector.add(endAbs, p5.Vector.mult(offsetDir, off));
       let s2 = p5.Vector.sub(startAbs, p5.Vector.mult(offsetDir, off));
       let e2 = p5.Vector.sub(endAbs, p5.Vector.mult(offsetDir, off));
-      strokeWeight(2); // thinner extras
+      strokeWeight(2);
       line(s1.x,s1.y,s1.z, e1.x,e1.y,e1.z);
       line(s2.x,s2.y,s2.z, e2.x,e2.y,e2.z);
     }
@@ -649,6 +759,8 @@ class LonePair extends ElectronDomain {
     if (arialFont) {
       push();
       translate(ovalPos.x, ovalPos.y, ovalPos.z);
+      // Undo scene rotations so label reads upright
+      rotateZ(-rotationZ);
       rotateY(-rotationY);
       rotateX(-rotationX);
       let verticalOffset = - (BOND_SPHERE_RADIUS * 1.6 + 12);
@@ -703,6 +815,8 @@ class PresetDomain {
     if (this.element && arialFont) {
       push();
       translate(this.pos.x, this.pos.y, this.pos.z);
+      // Undo scene rotations properly so label faces camera upright
+      rotateZ(-rotationZ);
       rotateY(-rotationY);
       rotateX(-rotationX);
       translate(0, -BOND_SPHERE_RADIUS - 10, 2.2);
@@ -735,6 +849,7 @@ class PresetDomain {
     if (arialFont) {
       push();
       translate(ovalPos.x, ovalPos.y, ovalPos.z);
+      rotateZ(-rotationZ);
       rotateY(-rotationY);
       rotateX(-rotationX);
       let verticalOffset = - (BOND_SPHERE_RADIUS * 1.6 + 12);
@@ -945,6 +1060,27 @@ function computePresetBondRoles(visual) {
   return roles;
 }
 
+/////////////////////// DRAW / UI RESET HELPER ///////////////////////
+// Restore angle overlay & auto-rotate toggles to the initial runtime state's values.
+// This is used when adding/removing domains via the UI in the top-right so the two toggles
+// go back to the original initial state while "everything else remains unchanged".
+function restoreAngleAndAutoToInitial() {
+  if (!initialRuntimeState) {
+    showAngleOverlay = false;
+    autoRotate = false;
+  } else {
+    showAngleOverlay = !!initialRuntimeState.showAngleOverlay;
+    autoRotate = !!initialRuntimeState.autoRotate;
+  }
+  // Update button labels if buttons exist (safe-guarded).
+  try {
+    if (angleToggleBtn) angleToggleBtn.html(showAngleOverlay ? I18N[currentLanguage].angle_on : I18N[currentLanguage].angle_off);
+  } catch (e) {}
+  try {
+    if (autoRotateBtn) autoRotateBtn.html(autoRotate ? I18N[currentLanguage].auto_on : I18N[currentLanguage].auto_off);
+  } catch (e) {}
+}
+
 /////////////////////// drawPresetMolecule ///////////////////////
 function drawPresetMolecule() {
   if (!presetMoleculeVisual) return;
@@ -961,6 +1097,7 @@ function drawPresetMolecule() {
   if (arialFont) {
     push();
     translate(CENTRAL_ATOM_POS.x, CENTRAL_ATOM_POS.y, CENTRAL_ATOM_POS.z);
+    rotateZ(-rotationZ);
     rotateY(-rotationY);
     rotateX(-rotationX);
     translate(0, -CENTRAL_ATOM_RADIUS - 18, 2.8);
@@ -1029,8 +1166,135 @@ function updateFormulaFromState() {
   formulaDiv.html(html);
 }
 
+/////////////////////// Robust world -> screen helper ///////////////////////
+/*
+  Some p5 builds (or usage modes) may not expose global screenX/screenY functions.
+  Try several strategies:
+  - use global screenX/screenY if available
+  - use the renderer.screenPosition (p5.RendererGL) if available via p5Canvas._renderer
+  - fallback to a simple orthographic-ish approximation so code doesn't throw (best-effort)
+*/
+function worldToScreen(worldPos) {
+  // ensure vector-like
+  let wp = sanitizeVec(worldPos, createVector(0,0,0));
+  try {
+    if (typeof screenX === 'function' && typeof screenY === 'function') {
+      return { x: screenX(wp.x, wp.y, wp.z), y: screenY(wp.x, wp.y, wp.z) };
+    }
+  } catch (e) {
+    // ignore and try other methods
+  }
+  try {
+    if (p5Canvas && p5Canvas._renderer && typeof p5Canvas._renderer.screenPosition === 'function') {
+      // renderer.screenPosition accepts a p5.Vector or x,y,z and returns a p5.Vector
+      let sv = p5Canvas._renderer.screenPosition(wp);
+      if (sv && typeof sv.x !== 'undefined' && typeof sv.y !== 'undefined') return { x: sv.x, y: sv.y };
+    }
+  } catch (e) {
+    // ignore
+  }
+  // Fallback: approximate screen coords using canvas center + scaled x,y (ignores perspective)
+  // This avoids throwing errors; labels may be slightly misplaced but readable.
+  let rectW = (p5Canvas && p5Canvas.elt && p5Canvas.elt.width) ? p5Canvas.elt.width : (typeof width !== 'undefined' ? width : window.innerWidth);
+  let rectH = (p5Canvas && p5Canvas.elt && p5Canvas.elt.height) ? p5Canvas.elt.height : (typeof height !== 'undefined' ? height : window.innerHeight);
+  let cx = rectW * 0.5;
+  let cy = rectH * 0.5;
+  // Apply scene scale (zoom * visualScale). This is a rough projection: uses world x/y directly.
+  let sx = cx + wp.x * (zoom * visualScale);
+  let sy = cy + wp.y * (zoom * visualScale);
+  return { x: sx, y: sy };
+}
+
+/////////////////////// Helpers to place labels without overlap ///////////////////////
+/*
+  Prefer lateral offsets in screen space, then small radial/displacements.
+*/
+function placeLabelNonOverlapping(worldPos, dir, existingScreens, minPx = 28) {
+  worldPos = worldPos.copy();
+  dir = safeNormalize(dir, createVector(0,0,1));
+
+  let tangent = p5.Vector.cross(dir, createVector(0,1,0));
+  if (tangent.mag() < 1e-6) tangent = p5.Vector.cross(dir, createVector(1,0,0));
+  tangent.normalize();
+  let normal = p5.Vector.cross(dir, tangent).normalize();
+
+  let scr0 = worldToScreen(worldPos);
+  let nearWorld = p5.Vector.add(worldPos, p5.Vector.mult(tangent, 8));
+  let scr1 = worldToScreen(nearWorld);
+  let st = createVector(scr1.x - scr0.x, scr1.y - scr0.y, 0);
+  if (st.mag() < 0.5) {
+    st = createVector(1, 0, 0);
+  } else st.normalize();
+  let sn = createVector(-st.y, st.x, 0);
+  sn.normalize();
+
+  const baseStep = 18;
+  const maxLateralAttempts = 12;
+  for (let attempt = 0; attempt < maxLateralAttempts; attempt++) {
+    let distIdx = Math.ceil((attempt + 1) / 2);
+    let side = (attempt % 2 === 0) ? 1 : -1;
+    let lateralOffset = p5.Vector.mult(st, side * baseStep * distIdx);
+    let vertJitter = ((attempt % 3) - 1) * 6;
+    let screenCandidate = { x: scr0.x + lateralOffset.x + sn.x * vertJitter, y: scr0.y + lateralOffset.y + sn.y * vertJitter };
+
+    let ok = true;
+    for (let p of existingScreens) {
+      let dx = screenCandidate.x - p.x;
+      let dy = screenCandidate.y - p.y;
+      if (dx*dx + dy*dy < minPx*minPx) { ok = false; break; }
+    }
+    if (ok) {
+      existingScreens.push({ x: screenCandidate.x, y: screenCandidate.y });
+      let rectW = (p5Canvas && p5Canvas.elt && p5Canvas.elt.width) ? p5Canvas.elt.width : (typeof width !== 'undefined' ? width : window.innerWidth);
+      let rectH = (p5Canvas && p5Canvas.elt && p5Canvas.elt.height) ? p5Canvas.elt.height : (typeof height !== 'undefined' ? height : window.innerHeight);
+      let cx = rectW * 0.5;
+      let cy = rectH * 0.5;
+      let wx = (screenCandidate.x - cx) / (zoom * visualScale);
+      let wy = (screenCandidate.y - cy) / (zoom * visualScale);
+      return createVector(wx, wy, worldPos.z);
+    }
+  }
+
+  const maxRadialAttempts = 10;
+  for (let attempt = 0; attempt < maxRadialAttempts; attempt++) {
+    let sx = worldToScreen(worldPos).x;
+    let sy = worldToScreen(worldPos).y;
+    let ok = true;
+    for (let p of existingScreens) {
+      let dx = sx - p.x;
+      let dy = sy - p.y;
+      if (dx*dx + dy*dy < minPx*minPx) { ok = false; break; }
+    }
+    if (ok) {
+      existingScreens.push({x: sx, y: sy});
+      let rectW = (p5Canvas && p5Canvas.elt && p5Canvas.elt.width) ? p5Canvas.elt.width : (typeof width !== 'undefined' ? width : window.innerWidth);
+      let rectH = (p5Canvas && p5Canvas.elt && p5Canvas.elt.height) ? p5Canvas.elt.height : (typeof height !== 'undefined' ? height : window.innerHeight);
+      let cx = rectW * 0.5;
+      let cy = rectH * 0.5;
+      let wx = (sx - cx) / (zoom * visualScale);
+      let wy = (sy - cy) / (zoom * visualScale);
+      return createVector(wx, wy, worldPos.z);
+    }
+    let step = 6 + attempt * 3;
+    let sign = (attempt % 2) ? -1 : 1;
+    let multT = Math.ceil((attempt+1)/2);
+    let multN = (attempt % 3) - 1;
+    worldPos = p5.Vector.add(worldPos, p5.Vector.add(tangent.copy().mult(sign * step * multT), normal.copy().mult(2 * multN)));
+  }
+
+  let scrFinal = worldToScreen(worldPos);
+  existingScreens.push({x: scrFinal.x, y: scrFinal.y});
+  let rectW = (p5Canvas && p5Canvas.elt && p5Canvas.elt.width) ? p5Canvas.elt.width : (typeof width !== 'undefined' ? width : window.innerWidth);
+  let rectH = (p5Canvas && p5Canvas.elt && p5Canvas.elt.height) ? p5Canvas.elt.height : (typeof height !== 'undefined' ? height : window.innerHeight);
+  let cx = rectW * 0.5;
+  let cy = rectH * 0.5;
+  let wx = (scrFinal.x - cx) / (zoom * visualScale);
+  let wy = (scrFinal.y - cy) / (zoom * visualScale);
+  return createVector(wx, wy, worldPos.z);
+}
+
 /////////////////////// drawAngleOverlaysForPreset ///////////////////////
-// (keeps previous logic; used also to compute representative fan for orientation)
+// KEPT prior behavior: use computeUniqueFanRadiusProposed (nearest grid slot guaratees non-conflict)
 function drawAngleOverlaysForPreset() {
   if (!presetMoleculeVisual) return;
 
@@ -1041,8 +1305,9 @@ function drawAngleOverlaysForPreset() {
   }
   if (bonds.length < 2) return;
 
-  const baseRadius = (2/3) * BOND_LENGTH;
-  const steps = 36;
+  const multiplier = presetMoleculeVisual.fanRadiusMultiplier || 1.0;
+  const baseRadius = (2/3) * BOND_LENGTH * multiplier;
+  const steps = ANGLE_STEPS;
 
   let roles = computePresetBondRoles(presetMoleculeVisual);
 
@@ -1053,6 +1318,9 @@ function drawAngleOverlaysForPreset() {
       break;
     }
   }
+
+  let usedLabelScreens = [];
+  let usedRadii = new Set();
 
   if (presetMoleculeVisual.name === 'SF₆') {
     const ao = presetMoleculeVisual.angleOverrides || {};
@@ -1068,7 +1336,8 @@ function drawAngleOverlaysForPreset() {
         if (dirA.mag() < 1e-6 || dirB.mag() < 1e-6) continue;
         let actualDeg = degrees(acos(constrain(dirA.dot(dirB), -1, 1)));
         if (Math.abs(actualDeg - desiredAngleDeg) <= toleranceDeg) {
-          candidatePairs.push({Aidx:A.idx, Bidx:B.idx, dirA:dirA.copy(), dirB:dirB.copy(), actualDeg});
+          let chord = p5.Vector.sub(presetMoleculeVisual.domains[A.idx].pos, presetMoleculeVisual.domains[B.idx].pos).mag();
+          candidatePairs.push({Aidx:A.idx, Bidx:B.idx, dirA:dirA.copy(), dirB:dirB.copy(), actualDeg, chordDist: chord});
         }
       }
     }
@@ -1103,12 +1372,20 @@ function drawAngleOverlaysForPreset() {
         reps.push(best);
       }
 
-      for (let rep of reps) {
+      let maxChord = 0;
+      for (let r of reps) if (r.chordDist && r.chordDist > maxChord) maxChord = r.chordDist;
+      if (maxChord <= 1e-6) maxChord = 1.0;
+
+      for (let rIdx=0;rIdx<reps.length;rIdx++) {
+        let rep = reps[rIdx];
         let dirA = rep.dirA.copy();
         let dirB = rep.dirB.copy();
         let angleToUse = radians(desiredAngleDeg);
         if (angleToUse < 1e-6) continue;
-        let radius = constrain(baseRadius * 0.9, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
+        let chord = rep.chordDist || 0;
+        let factor = 0.75 + 0.6 * (chord / maxChord);
+        let proposedBase = baseRadius * 0.9 * factor;
+        let radius = computeUniqueFanRadiusProposed(proposedBase, rep.chordDist + (rep.actualDeg||0)*7 + rIdx, usedRadii);
 
         let dotAB = constrain(dirA.dot(dirB), -1, 1);
         let stepsSeg = max(4, Math.ceil((angleToUse / PI) * steps));
@@ -1153,14 +1430,16 @@ function drawAngleOverlaysForPreset() {
         endShape();
         pop();
 
-        if (arialFont && pts.length>0) {
+        if (arialFont && pts.length>0 && RENDER_ANGLE_LABELS) {
           let mid = pts[Math.floor(pts.length/2)];
           if (mid) {
             let degLabel = Math.round(desiredAngleDeg * 10) / 10;
             let midPos = mid.pos.copy();
             midPos.add(p5.Vector.mult(mid.dir, 8));
+            let chosen = placeLabelNonOverlapping(midPos, mid.dir, usedLabelScreens, 28);
             push();
-            translate(midPos.x, midPos.y, midPos.z);
+            translate(chosen.x, chosen.y, chosen.z);
+            rotateZ(-rotationZ);
             rotateY(-rotationY);
             rotateX(-rotationX);
             textFont(arialFont);
@@ -1232,16 +1511,19 @@ function drawAngleOverlaysForPreset() {
     }
     let axialDir = chosenAxial.dir;
 
-    const renderFan = (dir1, dir2, angleDeg, roleHint) => {
+    const renderFan = (dir1, dir2, angleDeg, roleHint, chordDistOverride, seedVal, usedSet) => {
       let angleToUse = radians(angleDeg);
       if (angleToUse < 1e-6) return;
-      let radius = constrain(baseRadius * 0.9, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
-      if (roleHint === 'ax-basal') radius = constrain(baseRadius * 0.85, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
+      let chord = chordDistOverride || 0;
+      let proposedBase = baseRadius * 0.9 * (0.75 + 0.6 * (chord / max(1, chord)));
+      if (roleHint === 'ax-basal') proposedBase = proposedBase * (0.85/0.9);
+      let radius = computeUniqueFanRadiusProposed(proposedBase, seedVal || chord, usedRadii);
+
       let dotAB = constrain(dir1.dot(dir2), -1, 1);
       let stepsSeg = max(4, Math.ceil((angleToUse / PI) * steps));
       let pts = [];
       for (let k=0;k<=stepsSeg;k++){
-        let t = k / stepsSeg;
+        let t= k / stepsSeg;
         let pdir;
         if (abs(dotAB + 1.0) < 1e-6) {
           let axis = p5.Vector.cross(dir1, createVector(0.3,1,0.2));
@@ -1272,18 +1554,22 @@ function drawAngleOverlaysForPreset() {
       strokeWeight(1);
       noFill();
       beginShape();
-      for (let i=0;i<pts.length;i++) vertex(pts[i].pos.x, pts[i].pos.y, pts[i].pos.z);
+      for (let i=0;i<pts.length;i++) {
+        vertex(pts[i].pos.x, pts[i].pos.y, pts[i].pos.z);
+      }
       endShape();
       pop();
 
-      if (arialFont) {
+      if (arialFont && RENDER_ANGLE_LABELS) {
         let mid = pts[Math.floor(pts.length/2)];
         if (mid) {
           let degLabel = Math.round(angleDeg * 10) / 10;
           let midPos = mid.pos.copy();
           midPos.add(p5.Vector.mult(mid.dir, 8));
+          let chosen = placeLabelNonOverlapping(midPos, mid.dir, usedLabelScreens, 28);
           push();
-          translate(midPos.x, midPos.y, midPos.z);
+          translate(chosen.x, chosen.y, chosen.z);
+          rotateZ(-rotationZ);
           rotateY(-rotationY);
           rotateX(-rotationX);
           textFont(arialFont);
@@ -1297,17 +1583,20 @@ function drawAngleOverlaysForPreset() {
       }
     };
 
-    let bbAngle = presetMoleculeVisual.angleOverrides['basal-basal'] || 89.5;
-    renderFan(basalA, basalB, bbAngle, 'basal-basal');
-
+    let chordBasal = p5.Vector.sub(presetMoleculeVisual.domains[basalInfos[0].globalIndex].pos, presetMoleculeVisual.domains[basalInfos[1].globalIndex].pos).mag();
     let bestBas = basalInfos[0];
     let bestDot2 = -2;
     for (let b of basalInfos) {
       let dd = constrain(b.dir.dot(axialDir), -1, 1);
       if (dd > bestDot2) { bestDot2 = dd; bestBas = b; }
     }
+    let chordAxBas = p5.Vector.sub(presetMoleculeVisual.domains[chosenAxial.globalIndex].pos, presetMoleculeVisual.domains[bestBas.globalIndex].pos).mag();
+
+    let bbAngle = presetMoleculeVisual.angleOverrides['basal-basal'] || 89.5;
+    renderFan(basalA, basalB, bbAngle, 'basal-basal', chordBasal, chordBasal*1.3 + 1.7, usedRadii);
+
     let axbAngle = presetMoleculeVisual.angleOverrides['ax-basal'] || 84.8;
-    renderFan(axialDir, bestBas.dir, axbAngle, 'ax-basal');
+    renderFan(axialDir, bestBas.dir, axbAngle, 'ax-basal', chordAxBas, chordAxBas*2.1 + 3.3, usedRadii);
 
     return;
   }
@@ -1316,7 +1605,6 @@ function drawAngleOverlaysForPreset() {
     // IF7 handled by generic flow below but representative selection tuned there
   }
 
-  // generic rendering using preset angleOverrides
   let pairs = [];
   let ao = presetMoleculeVisual.angleOverrides || {};
   for (let a=0; a<bonds.length; a++){
@@ -1345,7 +1633,8 @@ function drawAngleOverlaysForPreset() {
       else if (typeof ao['BB'] !== 'undefined') angleDeg = ao['BB'];
       if (angleDeg === null || typeof angleDeg === 'undefined') continue;
       let angleRad = radians(angleDeg);
-      pairs.push({Aidx:A.idx, Bidx:B.idx, dirA, dirB, angle: angleRad, angleDeg, rolePair: [nrm(ri), nrm(rj)].sort().join('-'), chordDist: p5.Vector.sub(presetMoleculeVisual.domains[A.idx].pos, presetMoleculeVisual.domains[B.idx].pos).mag()});
+      let chordDist = p5.Vector.sub(presetMoleculeVisual.domains[A.idx].pos, presetMoleculeVisual.domains[B.idx].pos).mag();
+      pairs.push({Aidx:A.idx, Bidx:B.idx, dirA, dirB, angle: angleRad, angleDeg, rolePair: [nrm(ri), nrm(rj)].sort().join('-'), chordDist});
     }
   }
 
@@ -1360,11 +1649,8 @@ function drawAngleOverlaysForPreset() {
 
   let reps = [];
   for (let [k, arr] of groups.entries()) {
-    // Choose representative: normally the pair with largest chordDist (most visually separated).
-    // But IF7 eq-eq override (72°) should display adjacent equatorials (small chordDist).
     let best = arr[0];
     if (presetMoleculeVisual.name === 'IF₇' && arr[0].angleDeg && Math.abs(arr[0].angleDeg - 72.0) < 0.5) {
-      // choose smallest chordDist (adjacent equatorials)
       let bestDist = p5.Vector.sub(presetMoleculeVisual.domains[best.Aidx].pos, presetMoleculeVisual.domains[best.Bidx].pos).mag();
       for (let i=1;i<arr.length;i++){
         let cand = arr[i];
@@ -1372,7 +1658,6 @@ function drawAngleOverlaysForPreset() {
         if (d < bestDist) { bestDist = d; best = cand; }
       }
     } else {
-      // default: largest chordDist
       let bestDist = p5.Vector.sub(presetMoleculeVisual.domains[best.Aidx].pos, presetMoleculeVisual.domains[best.Bidx].pos).mag();
       for (let i=1;i<arr.length;i++){
         let cand = arr[i];
@@ -1383,7 +1668,12 @@ function drawAngleOverlaysForPreset() {
     reps.push(best);
   }
 
-  for (let rep of reps) {
+  let maxChord = 0;
+  for (let r of reps) if (r.chordDist && r.chordDist > maxChord) maxChord = r.chordDist;
+  if (maxChord <= 1e-6) maxChord = 1.0;
+
+  for (let rIdx=0;rIdx<reps.length;rIdx++) {
+    let rep = reps[rIdx];
     let dirA = rep.dirA.copy();
     let dirB = rep.dirB.copy();
     let angleToUse = rep.angle;
@@ -1391,27 +1681,31 @@ function drawAngleOverlaysForPreset() {
     let angleDeg = rep.angleDeg;
     let roleKey = rep.rolePair;
 
-    let radius = constrain(baseRadius * 0.9, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
+    let chord = rep.chordDist || 0;
+    let factor = 0.75 + 0.6 * (chord / maxChord);
+    let proposedBase = baseRadius * 0.9 * factor;
 
     if (presetMoleculeVisual.name === 'ClF₃' || presetMoleculeVisual.name === 'BrF₃') {
-      radius = constrain(baseRadius * 0.75, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
+      proposedBase = proposedBase * (0.75/0.9);
     }
 
     if (presetMoleculeVisual.name === 'SF₄') {
-      if (roleKey === 'ax-eq') radius = constrain(baseRadius * 0.7, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
-      else if (roleKey === 'ax-ax') radius = constrain(baseRadius * 1.12, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
+      if (roleKey === 'ax-eq') proposedBase = proposedBase * (0.7/0.9);
+      else if (roleKey === 'ax-ax') proposedBase = proposedBase * (1.12/0.9);
     }
 
     if (presetMoleculeVisual.name === 'PCl₅') {
-      if (roleKey === 'eq-eq') radius = constrain(baseRadius * 0.65, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
-      else if (roleKey === 'ax-eq') radius = constrain(baseRadius * 0.9, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
-      else if (roleKey === 'ax-ax') radius = constrain(baseRadius * 1.15, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
+      if (roleKey === 'eq-eq') proposedBase = proposedBase * (0.65/0.9);
+      else if (roleKey === 'ax-eq') proposedBase = proposedBase * (0.9/0.9);
+      else if (roleKey === 'ax-ax') proposedBase = proposedBase * (1.15/0.9);
     }
 
     if (presetMoleculeVisual.name === 'BrF₅') {
-      if (roleKey === 'basal-basal') radius = constrain(baseRadius * 0.9, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
-      else if (roleKey === 'ax-basal') radius = constrain(baseRadius * 0.85, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
+      if (roleKey === 'basal-basal') proposedBase = proposedBase * (0.9/0.9);
+      else if (roleKey === 'ax-basal') proposedBase = proposedBase * (0.85/0.9);
     }
+
+    let radius = computeUniqueFanRadiusProposed(proposedBase, rep.chordDist + rep.angleDeg*1.7 + rIdx*2.3, usedRadii);
 
     let dotAB = constrain(dirA.dot(dirB), -1, 1);
     let stepsSeg = max(4, Math.ceil((angleToUse / PI) * steps));
@@ -1458,14 +1752,16 @@ function drawAngleOverlaysForPreset() {
     endShape();
     pop();
 
-    if (arialFont) {
+    if (arialFont && RENDER_ANGLE_LABELS) {
       let mid = pts[Math.floor(pts.length/2)];
       if (mid) {
         let degLabel = Math.round(angleDeg * 10) / 10;
         let midPos = mid.pos.copy();
         midPos.add(p5.Vector.mult(mid.dir, 8));
+        let chosen = placeLabelNonOverlapping(midPos, mid.dir, usedLabelScreens, 28);
         push();
-        translate(midPos.x, midPos.y, midPos.z);
+        translate(chosen.x, chosen.y, chosen.z);
+        rotateZ(-rotationZ);
         rotateY(-rotationY);
         rotateX(-rotationX);
         textFont(arialFont);
@@ -1480,16 +1776,38 @@ function drawAngleOverlaysForPreset() {
   }
 }
 
+/////////////////////// computeSimulationBondRoles ///////////////////////
+// Similar to computeBondRoles but used for simulation molecules (when selectedMolecule is null)
+function computeSimulationBondRoles() {
+  let roles = new Array(electronDomains.length).fill('other');
+  let bondIndices = [];
+  for (let i=0;i<electronDomains.length;i++) if (electronDomains[i].type === 'bond') bondIndices.push(i);
+  if (bondIndices.length === 0) return roles;
+  let zs = bondIndices.map(i => abs(electronDomains[i].baseDir ? electronDomains[i].baseDir.z || 0 : 0));
+  let maxZ = max(...zs);
+  for (let k=0;k<bondIndices.length;k++){
+    let i = bondIndices[k];
+    let zval = abs(electronDomains[i].baseDir ? electronDomains[i].baseDir.z || 0 : 0);
+    if (zval >= 0.65 * maxZ && zval > 0.4) roles[i] = 'axial';
+    else roles[i] = 'equatorial';
+  }
+  if (bondIndices.length === 2) {
+    roles[bondIndices[0]] = 'axial';
+    roles[bondIndices[1]] = 'axial';
+  }
+  return roles;
+}
+
 /////////////////////// drawAngleOverlaysForSimulation ///////////////////////
+// New behavior: deterministic descending allocation anchored to the max requested radius for simulation molecules only.
+// Also: group equal angles with same role-type and show only one representative fan per group.
 function drawAngleOverlaysForSimulation() {
   if (!electronDomains || electronDomains.length < 2) return;
-
-  const baseRadius = (2/3) * BOND_LENGTH;
-  const steps = 36;
 
   let assignedTargets = null;
   if (isVSEPRMode) assignedTargets = computeAssignedTargets();
 
+  // Build bond list with directions
   let bonds = [];
   for (let i = 0; i < electronDomains.length; i++) {
     let d = electronDomains[i];
@@ -1508,7 +1826,9 @@ function drawAngleOverlaysForSimulation() {
 
   if (bonds.length < 2) return;
 
-  let pairs = [];
+  // use adaptive steps
+  const steps = ANGLE_STEPS;
+  let rawPairs = [];
   for (let a = 0; a < bonds.length; a++) {
     for (let b = a + 1; b < bonds.length; b++) {
       let A = bonds[a], B = bonds[b];
@@ -1520,39 +1840,80 @@ function drawAngleOverlaysForSimulation() {
       let posA = (A.assignedPos ? A.assignedPos : electronDomains[A.idx].pos);
       let posB = (B.assignedPos ? B.assignedPos : electronDomains[B.idx].pos);
       let chordDist = p5.Vector.sub(posA, posB).mag();
-      pairs.push({ Aidx: A.idx, Bidx: B.idx, dirA: A.dir.copy(), dirB: B.dir.copy(), angleRad: angRad, angleDeg: angDeg, chordDist });
+      rawPairs.push({ Aidx: A.idx, Bidx: B.idx, dirA: A.dir.copy(), dirB: B.dir.copy(), angleRad: angRad, angleDeg: angDeg, chordDist, proposedBase: null });
     }
   }
 
-  if (pairs.length === 0) return;
+  if (rawPairs.length === 0) return;
 
+  // Determine roles for simulation bonds (axial/equatorial heuristic)
+  let roles = computeSimulationBondRoles();
+  const normalizeRole = s => {
+    if (!s) return 'other';
+    if (s === 'axial') return 'ax';
+    if (s === 'equatorial') return 'eq';
+    return s;
+  };
+
+  // Group pairs by (rounded angle, rolePair) so equal angles of same type are merged
   let groups = new Map();
-  for (let p of pairs) {
-    let key = p.angleDeg.toFixed(1);
+  for (let p of rawPairs) {
+    let ri = roles[p.Aidx] ? roles[p.Aidx] : 'other';
+    let rj = roles[p.Bidx] ? roles[p.Bidx] : 'other';
+    let rkey = [normalizeRole(ri), normalizeRole(rj)].sort().join('-');
+    let angleKey = Number(p.angleDeg.toFixed(1)).toFixed(1);
+    let key = angleKey + '|' + rkey;
     if (!groups.has(key)) groups.set(key, []);
     groups.get(key).push(p);
   }
 
+  // For each group pick a representative (choose the pair with largest chordDist)
   let reps = [];
-  for (let [key, arr] of groups.entries()) {
+  for (let [k, arr] of groups.entries()) {
     let best = arr[0];
-    for (let i = 1; i < arr.length; i++) {
-      if (arr[i].chordDist > best.chordDist) best = arr[i];
+    let bestDist = arr[0].chordDist || 0;
+    for (let i=1;i<arr.length;i++){
+      if ((arr[i].chordDist || 0) > bestDist) { best = arr[i]; bestDist = arr[i].chordDist || 0; }
     }
-    reps.push({ key, rep: best });
+    reps.push(best);
   }
 
-  reps.sort((a,b) => parseFloat(a.key) - parseFloat(b.key));
+  // Compute proposed bases for each representative (same heuristic used for presets)
+  let maxChord = 0;
+  for (let r of reps) if (r.chordDist && r.chordDist > maxChord) maxChord = r.chordDist;
+  if (maxChord <= 1e-6) maxChord = 1.0;
+  let baseAnchor = (2/3) * BOND_LENGTH;
+  for (let r of reps) {
+    let chord = r.chordDist || 0;
+    let factor = 0.75 + 0.6 * (chord / maxChord);
+    let proposed = baseAnchor * 0.9 * factor;
+    r.proposedBase = constrain(proposed, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
+  }
 
-  for (let item of reps) {
-    let rep = item.rep;
+  // Sort descending so largest requested becomes anchor
+  reps.sort((a,b)=> b.proposedBase - a.proposedBase);
+
+  // Anchor computation (round to 20px grid), ensure sequence fits within bounds
+  const SPACING = 20;
+  const count = reps.length;
+  let maxRequested = reps[0].proposedBase;
+  let anchorGrid = roundToGrid(maxRequested, SPACING);
+  anchorGrid = clampAnchorForCount(anchorGrid, count, SPACING, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
+
+  // Assign allocated radii in descending order anchor, anchor-SPACING, anchor-2*SPACING, ...
+  for (let i=0;i<reps.length;i++){
+    reps[i].allocatedRadius = constrain(anchorGrid - i * SPACING, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
+  }
+
+  let usedLabelScreens = [];
+
+  // Render each allocated representative fan
+  for (let rep of reps) {
+    let angleToUse = rep.angleRad;
+    if (!angleToUse || angleToUse < 1e-6) continue;
     let dirA = rep.dirA.copy();
     let dirB = rep.dirB.copy();
-    let angleToUse = rep.angleRad;
-    if (angleToUse < 1e-6) continue;
-    let angleDeg = rep.angleDeg;
-
-    let radius = constrain(baseRadius * 0.9, FAN_MIN_RADIUS, FAN_MAX_RADIUS);
+    let radius = rep.allocatedRadius;
 
     let dotAB = constrain(dirA.dot(dirB), -1, 1);
     let stepsSeg = max(4, Math.ceil((angleToUse / PI) * steps));
@@ -1595,14 +1956,16 @@ function drawAngleOverlaysForSimulation() {
     endShape();
     pop();
 
-    if (arialFont) {
+    if (arialFont && RENDER_ANGLE_LABELS) {
       let mid = pts[Math.floor(pts.length/2)];
       if (mid) {
-        let degLabel = Number(angleDeg.toFixed(1));
+        let degLabel = Number(rep.angleDeg.toFixed(1));
         let midPos = mid.pos.copy();
         midPos.add(p5.Vector.mult(mid.dir, 8));
+        let chosen = placeLabelNonOverlapping(midPos, mid.dir, usedLabelScreens, 28);
         push();
-        translate(midPos.x, midPos.y, midPos.z);
+        translate(chosen.x, chosen.y, chosen.z);
+        rotateZ(-rotationZ);
         rotateY(-rotationY);
         rotateX(-rotationX);
         textFont(arialFont);
@@ -1693,12 +2056,8 @@ function startSyncToAssignedTargets(durationOverride) {
 }
 
 /////////////////////// Representative fan computation for orientation ///////////////////////
-// These functions find a single representative fan direction (now return plane normal = cross(dirA, dirB))
-// so the plane containing the fan will be perpendicular to the view.
-
 function computeRepresentativeFanDirectionForPreset() {
   if (!presetMoleculeVisual) return null;
-  // Re-use grouping logic similar to drawAngleOverlaysForPreset but return a direction vector (plane normal)
   let bonds = [];
   for (let i=0;i<presetMoleculeVisual.domains.length;i++){
     let d = presetMoleculeVisual.domains[i];
@@ -1739,19 +2098,16 @@ function computeRepresentativeFanDirectionForPreset() {
   }
   if (pairs.length === 0) return null;
 
-  // Group by angleDeg (coarse)
   let groups = {};
   for (let p of pairs) {
     let key = Number(p.angleDeg.toFixed(1));
     if (!groups[key]) groups[key]=[];
     groups[key].push(p);
   }
-  // pick the group with largest angle (heuristic)
   let keys = Object.keys(groups).map(k=>Number(k)).sort((a,b)=>b-a);
   if (keys.length === 0) return null;
   let chosenKey = keys[0];
   let arr = groups[chosenKey];
-  // pick representative: for IF7 eq-eq logic we prefer smallest chordDist for 72°
   let rep = arr[0];
   if (presetMoleculeVisual.name === 'IF₇' && Math.abs(Number(chosenKey) - 72.0) < 0.5) {
     let bestDist = arr[0].chordDist;
@@ -1764,14 +2120,69 @@ function computeRepresentativeFanDirectionForPreset() {
       if (p.chordDist > bestDist) { rep = p; bestDist = p.chordDist; }
     }
   }
-  // plane normal = cross(dirA, dirB)
+
+  // Compute plane normal (may be near-zero if directions nearly parallel).
   let n = p5.Vector.cross(rep.dirA, rep.dirB);
   if (n.mag() < 1e-6) {
-    // fallback: use mid direction
-    let mid = slerpVec(rep.dirA, rep.dirB, 0.5);
-    return safeNormalize(mid, rep.dirA);
+    // fallback: choose helper axis to produce a valid normal
+    let helper = abs(rep.dirA.x) < 0.9 ? createVector(1,0,0) : createVector(0,1,0);
+    n = p5.Vector.cross(rep.dirA, helper);
+    if (n.mag() < 1e-6) {
+      n = p5.Vector.cross(rep.dirB, helper);
+      if (n.mag() < 1e-6) return null;
+    }
   }
-  return safeNormalize(n, rep.dirA);
+
+  // We will choose the sign of the normal (n or -n) that makes the fan face the camera better,
+  // and also compute a roll so the fan's bisector lies vertically on screen for better visibility.
+  let mid = slerpVec(rep.dirA, rep.dirB, 0.5);
+  mid.normalize();
+
+  // helper to rotate a vector by rotateX then rotateY (same order used in draw)
+  function rotateVecByXthenY(v, rx, ry) {
+    let x=v.x, y=v.y, z=v.z;
+    let c = cos(rx), s = sin(rx);
+    let y1 = y*c - z*s;
+    let z1 = y*s + z*c;
+    let x1 = x;
+    let c2 = cos(ry), s2 = sin(ry);
+    let x2 = x1*c2 + z1*s2;
+    let y2 = y1;
+    let z2 = -x1*s2 + z1*c2;
+    return createVector(x2,y2,z2);
+  }
+
+  // try both normal signs and pick the one where the mid vector after applying rotations has more negative z (faces camera)
+  let bestSign = 1;
+  let bestScore = -1e9;
+  let bestRot = {x:0,y:0};
+  let bestRotatedMid = null;
+  for (let sign of [1, -1]) {
+    let cand = p5.Vector.mult(n, sign);
+    cand.normalize();
+    let rot = computeRotationForDirection(cand);
+    let rotatedMid = rotateVecByXthenY(mid, rot.x, rot.y);
+    // we want rotatedMid.z to be negative (pointing toward camera which looks -z). Score by -z (higher better).
+    let score = -rotatedMid.z;
+    // prefer strong face-on and some vertical component so the fan isn't exactly edge-aligned vertically
+    score += 0.1 * abs(rotatedMid.y);
+    if (score > bestScore) { bestScore = score; bestSign = sign; bestRot = rot; bestRotatedMid = rotatedMid; }
+  }
+
+  let chosenNormal = p5.Vector.mult(n, bestSign).normalize();
+  // compute desired roll so that mid vector projects more vertically (aligned with screen Y)
+  let roll = 0;
+  if (bestRotatedMid) {
+    // atan2(x, y) gives angle to rotate around Z to align vector to +Y axis.
+    roll = -atan2(bestRotatedMid.x, bestRotatedMid.y || 1e-9);
+    // clamp roll to avoid extreme spinning
+    if (roll > PI) roll -= TWO_PI;
+    if (roll < -PI) roll += TWO_PI;
+    // limit to reasonable tilt (avoid upside-down)
+    roll = constrain(roll, -PI*0.9, PI*0.9);
+  }
+
+  return { dir: chosenNormal, roll };
 }
 
 function computeRepresentativeFanDirectionForSimulation() {
@@ -1811,7 +2222,6 @@ function computeRepresentativeFanDirectionForSimulation() {
   }
   if (pairs.length === 0) return null;
 
-  // Group by angle and pick representative with largest chordDist
   let groups = {};
   for (let p of pairs) {
     let key = Number(p.angDeg.toFixed(1));
@@ -1820,7 +2230,6 @@ function computeRepresentativeFanDirectionForSimulation() {
   }
   let keys = Object.keys(groups);
   if (keys.length === 0) return null;
-  // pick the group with maximum count then largest angle (heuristic)
   keys.sort((a,b)=> groups[b].length - groups[a].length || parseFloat(b) - parseFloat(a));
   let arr = groups[keys[0]];
   let rep = arr[0];
@@ -1828,64 +2237,133 @@ function computeRepresentativeFanDirectionForSimulation() {
   for (let p of arr) {
     if (p.chordDist > bestDist) { rep = p; bestDist = p.chordDist; }
   }
-  // plane normal
+
+  // compute plane normal
   let n = p5.Vector.cross(rep.dirA, rep.dirB);
   if (n.mag() < 1e-6) {
-    let midDir = slerpVec(rep.dirA, rep.dirB, 0.5);
-    return safeNormalize(midDir, rep.dirA);
+    // fallback helper axis
+    let helper = abs(rep.dirA.x) < 0.9 ? createVector(1,0,0) : createVector(0,1,0);
+    n = p5.Vector.cross(rep.dirA, helper);
+    if (n.mag() < 1e-6) {
+      n = p5.Vector.cross(rep.dirB, helper);
+      if (n.mag() < 1e-6) return null;
+    }
   }
-  return safeNormalize(n, rep.dirA);
+
+  let midDir = slerpVec(rep.dirA, rep.dirB, 0.5);
+  midDir.normalize();
+
+  function rotateVecByXthenY(v, rx, ry) {
+    let x=v.x, y=v.y, z=v.z;
+    let c = cos(rx), s = sin(rx);
+    let y1 = y*c - z*s;
+    let z1 = y*s + z*c;
+    let x1 = x;
+    let c2 = cos(ry), s2 = sin(ry);
+    let x2 = x1*c2 + z1*s2;
+    let y2 = y1;
+    let z2 = -x1*s2 + z1*c2;
+    return createVector(x2,y2,z2);
+  }
+
+  let bestSign = 1;
+  let bestScore = -1e9;
+  let bestRot = {x:0,y:0};
+  let bestRotatedMid = null;
+  for (let sign of [1, -1]) {
+    let cand = p5.Vector.mult(n, sign);
+    cand.normalize();
+    let rot = computeRotationForDirection(cand);
+    let rotatedMid = rotateVecByXthenY(midDir, rot.x, rot.y);
+    let score = -rotatedMid.z;
+    score += 0.1 * abs(rotatedMid.y);
+    if (score > bestScore) { bestScore = score; bestSign = sign; bestRot = rot; bestRotatedMid = rotatedMid; }
+  }
+
+  let chosenNormal = p5.Vector.mult(n, bestSign).normalize();
+  let roll = 0;
+  if (bestRotatedMid) {
+    roll = -atan2(bestRotatedMid.x, bestRotatedMid.y || 1e-9);
+    if (roll > PI) roll -= TWO_PI;
+    if (roll < -PI) roll += TWO_PI;
+    roll = constrain(roll, -PI*0.9, PI*0.9);
+  }
+
+  return { dir: chosenNormal, roll };
 }
 
 /////////////////////// Orientation helpers ///////////////////////
 function computeRotationForDirection(targetDir) {
-  // Ensure normalized
   let v = safeNormalize(targetDir, createVector(0,0,-1));
-  // Camera forward should be -v. Compute camera yaw (around Y) and pitch (around X).
-  // yaw_cam = atan2(-v.x, -v.z)
-  // pitch_cam = atan2(v.y, sqrt(v.x^2 + v.z^2))
   let yaw_cam = atan2(-v.x, -v.z);
   let horizLen = sqrt(v.x*v.x + v.z*v.z);
-  let pitch_cam = atan2(v.y, horizLen); // positive pitch rotates camera up
-  // Scene rotations are negatives of camera rotations:
+  let pitch_cam = atan2(v.y, horizLen);
   let sceneRotY = -yaw_cam;
   let sceneRotX = -pitch_cam;
-  // Normalize angles to avoid large jumps (keep in -PI..PI)
   sceneRotX = ((sceneRotX + PI) % (2*PI)) - PI;
   sceneRotY = ((sceneRotY + PI) % (2*PI)) - PI;
   return {x: sceneRotX, y: sceneRotY};
 }
 
-function orientSceneToDirection(targetDir, durationMs = 700) {
+function orientSceneToDirection(targetDir, durationMs = 700, targetRoll = 0) {
   if (!targetDir) return;
   let rot = computeRotationForDirection(targetDir);
+
+  // store start rotations
   orientStartRotX = rotationX;
   orientStartRotY = rotationY;
-  orientTargetRotX = rot.x;
-  orientTargetRotY = rot.y;
+  orientStartRotZ = rotationZ;
+
+  // choose orientTargetRotX/Y near current rotations to preserve rotational continuity
+  let tx = rot.x;
+  let ty = rot.y;
+
+  // Adjust tx so difference to current rotationX is within [-PI, PI] (add/subtract 2PI if needed)
+  let dx = tx - orientStartRotX;
+  if (dx > PI) tx -= TWO_PI;
+  else if (dx < -PI) tx += TWO_PI;
+
+  // Adjust ty similarly for rotationY
+  let dy = ty - orientStartRotY;
+  if (dy > PI) ty -= TWO_PI;
+  else if (dy < -PI) ty += TWO_PI;
+
+  orientTargetRotX = tx;
+  orientTargetRotY = ty;
+
+  // Normalize and adjust roll to be continuous as well
+  let r = targetRoll;
+  r = ((r + PI) % (2*PI)) - PI;
+  let dz = r - orientStartRotZ;
+  if (dz > PI) r -= TWO_PI;
+  else if (dz < -PI) r += TWO_PI;
+  orientTargetRotZ = r;
+
+  // If autoRotate currently on, suspend it while the orient animation runs, and remember to restore afterwards.
+  if (autoRotate) {
+    autoRotateSuspendedDuringOrient = true;
+    autoRotate = false;
+  } else {
+    autoRotateSuspendedDuringOrient = false;
+  }
+
   orientStartTime = millis();
   orientDuration = constrain(durationMs, 120, 2000);
   orientActive = true;
-  // temporarily disable autoRotate, store state
-  savedAutoRotate = autoRotate;
-  autoRotate = false;
 }
 
 function orientToMostRepresentativeFan() {
-  // Prefer preset fan if a preset is active, else simulation fan.
-  let dir = null;
+  let res = null;
   if (presetMoleculeVisual) {
-    dir = computeRepresentativeFanDirectionForPreset();
+    res = computeRepresentativeFanDirectionForPreset();
   } else {
-    dir = computeRepresentativeFanDirectionForSimulation();
+    res = computeRepresentativeFanDirectionForSimulation();
   }
-  if (!dir) return;
-  // orient so that this direction is head-on (camera looks along -dir)
-  orientSceneToDirection(dir, 700);
+  if (!res) return;
+  orientSceneToDirection(res.dir, 700, res.roll || 0);
 }
 
 /////////////////////// Simulation, UI and handlers ///////////////////////
-// Centralized drag end handler to make adding robust even when mouseup occurs outside canvas.
 function endDragAtClientCoords(clientX, clientY) {
   if (!isDragging) return;
 
@@ -1913,7 +2391,9 @@ function endDragAtClientCoords(clientX, clientY) {
     newDom.tangentOffset = createVector(0,0,0); newDom.swayStartTime = millis(); newDom.swayDuration = random(300,900);
     electronDomains.push(newDom);
 
-    // Animate to canonical VSEPR positions (smooth)
+    // Reset angle/auto toggles to initial state when adding via top-right UI
+    restoreAngleAndAutoToInitial();
+
     applyVSEPRPositions(520, false);
   } else {
     let order = 1;
@@ -1938,7 +2418,9 @@ function endDragAtClientCoords(clientX, clientY) {
       electronDomains.push(newDom);
     }
 
-    // Animate to canonical VSEPR positions (smooth)
+    // Reset angle/auto toggles to initial state when adding via top-right UI
+    restoreAngleAndAutoToInitial();
+
     applyVSEPRPositions(520, false);
   }
 
@@ -2080,7 +2562,7 @@ function simulateRepulsion() {
   }
 }
 
-function initialRepulsionRelax(iterations=4) {
+function initialRepulsionRelax(iterations=INITIAL_RELAX_ITERS) {
   let n = electronDomains.length;
   if (n < 2) return;
   iterations = Math.min(Math.max(iterations, 2), Math.round(8 * Math.sqrt(Math.max(1, n))));
@@ -2177,25 +2659,42 @@ function createUI() {
   languageSelect.option('English', 'en');
   languageSelect.value(currentLanguage);
   languageSelect.style('padding','6px');
+  languageSelect.style('cursor', 'pointer');
+  languageSelect.style('transition', 'transform 0.12s ease, box-shadow 0.12s ease');
+  languageSelect.mouseOver(()=>{ languageSelect.style('transform','scale(1.04)'); languageSelect.style('box-shadow','0 6px 12px rgba(0,0,0,0.35)'); });
+  languageSelect.mouseOut(()=>{ languageSelect.style('transform','none'); languageSelect.style('box-shadow','none'); });
   languageSelect.changed(()=>{
     currentLanguage = languageSelect.value();
     updateUILanguage();
   });
+
+  // Angle toggle: independent from auto-rotate. Do NOT mutate autoRotate here.
   angleToggleBtn = createButton(showAngleOverlay ? I18N[currentLanguage].angle_on : I18N[currentLanguage].angle_off);
   angleToggleBtn.parent(leftUI);
   angleToggleBtn.style('padding','6px');
   angleToggleBtn.style('border','0.8px solid #444');
   angleToggleBtn.style('border-radius','4px');
+  angleToggleBtn.style('transition','transform 0.12s ease, box-shadow 0.12s ease');
+  angleToggleBtn.style('cursor','pointer');
+  angleToggleBtn.mouseOver(()=>{ angleToggleBtn.style('transform','scale(1.04)'); angleToggleBtn.style('box-shadow','0 6px 12px rgba(0,0,0,0.35)'); });
+  angleToggleBtn.mouseOut(()=>{ angleToggleBtn.style('transform','none'); angleToggleBtn.style('box-shadow','none'); });
+
   angleToggleBtn.mousePressed(() => {
     showAngleOverlay = !showAngleOverlay;
     angleToggleBtn.html(showAngleOverlay ? I18N[currentLanguage].angle_on : I18N[currentLanguage].angle_off);
     if (showAngleOverlay) {
-      // Trigger orientation toward the most representative fan when user enables angles.
+      // Start orient animation to the most representative fan.
       orientToMostRepresentativeFan();
     } else {
-      // When turning off angle overlay, cancel orientation animation and restore autoRotate if it was set.
-      orientActive = false;
-      autoRotate = savedAutoRotate;
+      // Stop any ongoing orient animation. Do not change the user's autoRotate preference here.
+      if (orientActive) {
+        orientActive = false;
+        // If the orient animation had suspended auto-rotate, restore it now.
+        if (autoRotateSuspendedDuringOrient) {
+          autoRotate = true;
+          autoRotateSuspendedDuringOrient = false;
+        }
+      }
     }
   });
 
@@ -2204,9 +2703,20 @@ function createUI() {
   autoRotateBtn.style('padding','6px');
   autoRotateBtn.style('border','0.8px solid #444');
   autoRotateBtn.style('border-radius','4px');
+  autoRotateBtn.style('transition','transform 0.12s ease, box-shadow 0.12s ease');
+  autoRotateBtn.style('cursor','pointer');
+  autoRotateBtn.mouseOver(()=>{ autoRotateBtn.style('transform','scale(1.04)'); autoRotateBtn.style('box-shadow','0 6px 12px rgba(0,0,0,0.35)'); });
+  autoRotateBtn.mouseOut(()=>{ autoRotateBtn.style('transform','none'); autoRotateBtn.style('box-shadow','none'); });
+
   autoRotateBtn.mousePressed(() => {
+    // Toggle autoRotate independent of the angle overlay state.
     autoRotate = !autoRotate;
     autoRotateBtn.html(autoRotate ? I18N[currentLanguage].auto_on : I18N[currentLanguage].auto_off);
+    // If user explicitly enabled autoRotate while an orient animation is running, cancel that animation.
+    if (orientActive) {
+      orientActive = false;
+      autoRotateSuspendedDuringOrient = false;
+    }
   });
 
   resetBtn = createButton(I18N[currentLanguage].reset);
@@ -2214,6 +2724,11 @@ function createUI() {
   resetBtn.style('padding','6px');
   resetBtn.style('border','0.8px solid #444');
   resetBtn.style('border-radius','4px');
+  resetBtn.style('transition','transform 0.12s ease, box-shadow 0.12s ease');
+  resetBtn.style('cursor','pointer');
+  resetBtn.mouseOver(()=>{ resetBtn.style('transform','scale(1.04)'); resetBtn.style('box-shadow','0 6px 12px rgba(0,0,0,0.35)'); });
+  resetBtn.mouseOut(()=>{ resetBtn.style('transform','none'); resetBtn.style('box-shadow','none'); });
+
   resetBtn.mousePressed(() => {
     resetToInitialState();
   });
@@ -2224,6 +2739,10 @@ function createUI() {
   moleculeSelect.option(I18N[currentLanguage].molecule_placeholder, '');
   for (let name of MOLECULE_ORDER) moleculeSelect.option(name, name);
   try { moleculeSelect.elt.options[0].disabled = true; moleculeSelect.elt.selectedIndex = 0; } catch (e) {}
+  moleculeSelect.style('cursor', 'pointer');
+  moleculeSelect.style('transition', 'transform 0.12s ease, box-shadow 0.12s ease');
+  moleculeSelect.mouseOver(()=>{ moleculeSelect.style('transform','scale(1.04)'); moleculeSelect.style('box-shadow','0 6px 12px rgba(0,0,0,0.35)'); });
+  moleculeSelect.mouseOut(()=>{ moleculeSelect.style('transform','none'); moleculeSelect.style('box-shadow','none'); });
   moleculeSelect.changed(()=>{ let val = moleculeSelect.value(); if (!val) { clearSelectedMolecule(); } else applyMolecule(val); });
 
   notesBtn = createButton(I18N[currentLanguage].notes);
@@ -2231,6 +2750,11 @@ function createUI() {
   notesBtn.style('padding','6px');
   notesBtn.style('border','0.8px solid #444');
   notesBtn.style('border-radius','4px');
+  notesBtn.style('transition','transform 0.12s ease, box-shadow 0.12s ease');
+  notesBtn.style('cursor','pointer');
+  notesBtn.mouseOver(()=>{ notesBtn.style('transform','scale(1.04)'); notesBtn.style('box-shadow','0 6px 12px rgba(0,0,0,0.35)'); });
+  notesBtn.mouseOut(()=>{ notesBtn.style('transform','none'); notesBtn.style('box-shadow','none'); });
+
   notesBtn.mousePressed(()=>{ toggleNotesModal(); });
 
   formulaDiv = createDiv('AXnEm');
@@ -2282,6 +2806,16 @@ function createUI() {
         return;
       }
       e.preventDefault();
+
+      // Cancel any automatic orient animation when user starts dragging from the UI.
+      if (orientActive) {
+        orientActive = false;
+        // restore auto-rotate only if the orient routine had suspended it
+        if (autoRotateSuspendedDuringOrient) {
+          autoRotate = true;
+          autoRotateSuspendedDuringOrient = false;
+        }
+      }
 
       isDragging = true;
       draggedElementType = type;
@@ -2372,6 +2906,22 @@ function createUI() {
 
   notesModal.notesContentDiv = notesContentDiv;
   notesModal.modalBox = modalBox;
+
+  // Ensure clicking the canvas cancels any orient animation so user can immediately rotate
+  // and restore auto-rotate only if orient had suspended it.
+  window.addEventListener('mousedown', (e) => {
+    if (!p5Canvas || !p5Canvas.elt) return;
+    const rect = p5Canvas.elt.getBoundingClientRect();
+    if (e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom) {
+      if (orientActive) {
+        orientActive = false;
+        if (autoRotateSuspendedDuringOrient) {
+          autoRotate = true;
+          autoRotateSuspendedDuringOrient = false;
+        }
+      }
+    }
+  }, { passive: true });
 }
 
 function toggleNotesModal() {
@@ -2455,6 +3005,14 @@ function mouseWheel(event) {
 }
 
 function mouseDragged(event) {
+  // If user actively drags rotation, cancel automatic orient animation so rotation is fully manual
+  if (orientActive) {
+    orientActive = false;
+    if (autoRotateSuspendedDuringOrient) {
+      autoRotate = true;
+      autoRotateSuspendedDuringOrient = false;
+    }
+  }
   if (isDragging) return false;
   let dx = mouseX - pmouseX;
   let dy = mouseY - pmouseY;
@@ -2506,25 +3064,23 @@ function updatePreviewDomain() {
   if (ideal >= POP_COMPLETE_R) {
     if (popCompleteTime===0) popCompleteTime = millis();
     else if (millis()-popCompleteTime > POP_TO_DOMAIN_DELAY) {
-let newDom;
-if (previewDomain.type === 'lonepair') {
-  newDom = new LonePair(previewDomain.pos.copy());
-} else {
-  // xác định order từ loại preview (single/double/triple)
-  let order = 1;
-  if (previewDomain.type === 'double') order = 2;
-  else if (previewDomain.type === 'triple') order = 3;
-  // allow previewDomain.element if set, else default 'X'
-  let element = previewDomain.element || 'X';
-  newDom = new Bond(previewDomain.pos.copy(), element, order);
-}
+      let newDom;
+      if (previewDomain.type === 'lonepair') {
+        newDom = new LonePair(previewDomain.pos.copy());
+      } else {
+        let order = 1;
+        if (previewDomain.type === 'double') order = 2;
+        else if (previewDomain.type === 'triple') order = 3;
+        let element = previewDomain.element || 'X';
+        newDom = new Bond(previewDomain.pos.copy(), element, order);
+      }
       newDom.tangentOffset = previewDomain.tangentOffset ? previewDomain.tangentOffset.copy() : createVector(0,0,0);
       newDom.tangentAmp = previewDomain.tangentAmp || newDom.tangentAmp;
       newDom.noiseSeed = previewDomain.noiseSeed || newDom.noiseSeed;
       newDom.swayStartTime = previewDomain.swayStartTime || millis();
       newDom.swayDuration = previewDomain.swayDuration || 0;
       electronDomains.push(newDom);
-      initialRepulsionRelax(6);
+      initialRepulsionRelax(INITIAL_RELAX_ITERS);
       previewDomain = null;
       applyVSEPRPositions(520, false);
       updateFormulaFromState();
@@ -2587,40 +3143,40 @@ function getMoleculeAngleOverride(i, j) {
 
 function updateDomainListUI() {
   if (!domainListPanel) return;
+  let now = millis();
+  if (now - lastUIUpdateTime < UI_UPDATE_INTERVAL) return;
+  lastUIUpdateTime = now;
+
   domainListPanel.html('');
   if (electronDomains.length === 0) return;
   electronDomains.forEach(dom => {
     let row = createDiv(); row.parent(domainListPanel);
     row.style('display','flex'); row.style('align-items','center'); row.style('justify-content','space-between'); row.style('margin-bottom','6px');
     let left = createDiv(); left.parent(row); left.style('display','flex'); left.style('align-items','center'); left.style('gap','6px');
-let iconHtml = '';
-if (dom.type === 'bond') {
-  // Hiển thị biểu tượng theo thứ tự liên kết (order)
-  if (dom.order === 2) {
-    // double bond: hai gạch song song
-    iconHtml = `
+    let iconHtml = '';
+    if (dom.type === 'bond') {
+      if (dom.order === 2) {
+        iconHtml = `
       <svg width="30" height="10" viewBox="0 0 40 10" xmlns="http://www.w3.org/2000/svg">
         <line x1="0" y1="3" x2="40" y2="3" stroke="white" stroke-width="0.9" stroke-linecap="round"/>
         <line x1="0" y1="7" x2="40" y2="7" stroke="white" stroke-width="0.9" stroke-linecap="round"/>
       </svg>`;
-  } else if (dom.order === 3) {
-    // triple bond: ba gạch song song
-    iconHtml = `
+      } else if (dom.order === 3) {
+        iconHtml = `
       <svg width="30" height="14" viewBox="0 0 40 14" xmlns="http://www.w3.org/2000/svg">
         <line x1="0" y1="3" x2="40" y2="3" stroke="white" stroke-width="0.9" stroke-linecap="round"/>
         <line x1="0" y1="7" x2="40" y2="7" stroke="white" stroke-width="0.9" stroke-linecap="round"/>
         <line x1="0" y1="11" x2="40" y2="11" stroke="white" stroke-width="0.9" stroke-linecap="round"/>
       </svg>`;
-  } else {
-    // single bond: một gạch
-    iconHtml = `
+      } else {
+        iconHtml = `
       <svg width="30" height="6" viewBox="0 0 40 6" xmlns="http://www.w3.org/2000/svg">
         <line x1="0" y1="3" x2="40" y2="3" stroke="white" stroke-width="0.9" stroke-linecap="round"/>
       </svg>`;
-  }
-} else if (dom.type === 'lonepair') {
-  iconHtml = `<svg width="30" height="20" viewBox="0 0 30 20"><path d="M 0 10 Q 4 -5 20 5 C 26 10 20 15 20 15 Q 4 25 0 10 Z" fill="rgba(255,255,255,0.2)"/><circle cx="10" cy="7" r="1.6" fill="white"/><circle cx="10" cy="13" r="1.6" fill="white"/></svg>`;
-}
+      }
+    } else if (dom.type === 'lonepair') {
+      iconHtml = `<svg width="30" height="20" viewBox="0 0 30 20"><path d="M 0 10 Q 4 -5 20 5 C 26 10 20 15 20 15 Q 4 25 0 10 Z" fill="rgba(255,255,255,0.2)"/><circle cx="10" cy="7" r="1.6" fill="white"/><circle cx="10" cy="13" r="1.6" fill="white"/></svg>`;
+    }
     let icon = createDiv(iconHtml); icon.parent(left); icon.elt.style.pointerEvents = 'none';
     let label = createDiv(`#${dom.id} (${dom.type}${dom.element ? ' ' + dom.element : ''}${dom.order ? ' x' + dom.order : ''})`); label.parent(left); label.style('font-size','12px'); label.style('color','white');
     let removeBtn = createButton('x'); removeBtn.parent(row); removeBtn.style('background','red'); removeBtn.style('color','white');
@@ -2641,7 +3197,9 @@ if (dom.type === 'bond') {
   updateFormulaFromState();
 }
 
-function removeDomainById(id) { const nid = Number(id); if (isNaN(nid)) return; if (selectedMolecule) return; let index = electronDomains.findIndex(dom => dom.id === nid); if (index !== -1) { electronDomains.splice(index, 1); applyVSEPRPositions(520, false); updateDomainListUI(); updateFormulaFromState(); } }
+function removeDomainById(id) { const nid = Number(id); if (isNaN(nid)) return; if (selectedMolecule) return; let index = electronDomains.findIndex(dom => dom.id === nid); if (index !== -1) { electronDomains.splice(index, 1); // Reset angle/auto toggles to initial state when removing via top-right UI
+  restoreAngleAndAutoToInitial();
+  applyVSEPRPositions(520, false); updateDomainListUI(); updateFormulaFromState(); } }
 window.removeDomainById = removeDomainById;
 
 function resetToInitialState() {
@@ -2654,6 +3212,7 @@ function resetToInitialState() {
   zoom = initialRuntimeState ? initialRuntimeState.zoom : zoom;
   rotationX = initialRuntimeState ? initialRuntimeState.rotationX : 0;
   rotationY = initialRuntimeState ? initialRuntimeState.rotationY : 0;
+  rotationZ = 0;
   autoRotate = initialRuntimeState ? initialRuntimeState.autoRotate : false;
   showAngleOverlay = initialRuntimeState ? initialRuntimeState.showAngleOverlay : false;
   isVSEPRMode = initialRuntimeState ? !!initialRuntimeState.isVSEPRMode : false;
@@ -2707,6 +3266,7 @@ function drawCentralLabel() {
   if (!arialFont) return;
   push();
   translate(CENTRAL_ATOM_POS.x, CENTRAL_ATOM_POS.y, CENTRAL_ATOM_POS.z);
+  rotateZ(-rotationZ);
   rotateY(-rotationY);
   rotateX(-rotationX);
   translate(0, -CENTRAL_ATOM_RADIUS - 14, 1.6);
@@ -2720,10 +3280,19 @@ function drawCentralLabel() {
 }
 
 function setup() {
+  PIXEL_DENSITY = isMobileDevice ? 1 : Math.min(window.devicePixelRatio || 1, 2);
+  pixelDensity(PIXEL_DENSITY);
   p5Canvas = createCanvas(windowWidth, windowHeight, WEBGL);
   noStroke();
   if (arialFont) textFont(arialFont);
   textSize(12); textAlign(CENTER, CENTER);
+  if (typeof sphereDetail === 'function') {
+    try {
+      sphereDetail(SPHERE_DETAIL);
+    } catch (e) {
+      console.warn('sphereDetail call failed, continuing without changing detail:', e);
+    }
+  }
   camera(camX, camY, camZ);
   perspective(PI/4, width / max(1, height), 0.1, 5000);
   noiseDetail(3,0.5);
@@ -2760,10 +3329,16 @@ function windowResized() {
 
 function draw() {
   background(0);
+  // Simplify lights on mobile for performance
   ambientLight(40);
-  pointLight(160,160,160, 400,400,600);
-  pointLight(80,80,80, -400,-400,-600);
-  directionalLight(140,140,140, 0.5,0.5,-1);
+  if (!isMobileDevice) {
+    pointLight(160,160,160, 400,400,600);
+    pointLight(80,80,80, -400,-400,-600);
+    directionalLight(140,140,140, 0.5,0.5,-1);
+  } else {
+    // single light source on mobile
+    pointLight(160,160,160, 300,300,400);
+  }
 
   // If orientActive, smoothly interpolate rotationX/Y toward targets.
   if (orientActive) {
@@ -2782,6 +3357,12 @@ function draw() {
     if (dy > PI) dy -= TWO_PI;
     if (dy < -PI) dy += TWO_PI;
     rotationY = sy + dy * eased;
+    // Interpolate roll (rotationZ)
+    let sz = orientStartRotZ, tz = orientTargetRotZ;
+    let dz = tz - sz;
+    if (dz > PI) dz -= TWO_PI;
+    if (dz < -PI) dz += TWO_PI;
+    rotationZ = sz + dz * eased;
 
     if (t >= 1.0 - 1e-6) {
       orientActive = false;
@@ -2797,6 +3378,7 @@ function draw() {
 
   rotateX(rotationX);
   rotateY(rotationY);
+  rotateZ(rotationZ);
   scale(zoom * visualScale);
 
   // Sync animation (interpolate baseDir -> syncTargetDirs)
@@ -2809,7 +3391,7 @@ function draw() {
       let initDir = (syncInitialDirs[i] ? syncInitialDirs[i].copy() : (dom.baseDir ? dom.baseDir.copy() : safeNormalize(p5.Vector.sub(dom.pos, CENTRAL_ATOM_POS), createVector(1,0,0))));
       let tgtDir = (syncTargetDirs[i] ? syncTargetDirs[i].copy() : initDir.copy());
       let dir = slerpVec(initDir, tgtDir, eased);
-dom.baseDir = dir.copy();
+      dom.baseDir = dir.copy();
       dom.baseDir.normalize();
       let ideal = (dom.type === 'lonepair') ? LONE_PAIR_BOND_LENGTH : BOND_LENGTH;
       dom.pos = p5.Vector.add(CENTRAL_ATOM_POS, safeMult(dom.baseDir, ideal));
@@ -2902,9 +3484,21 @@ dom.baseDir = dir.copy();
     }
   }
 
-  // Run simulation step unless we're syncing to targets
-  if (!isSyncing) {
-    try { simulateRepulsion(); } catch (e) { /* ignore runtime errors */ }
+  // Run simulation step unless we're syncing to targets. Throttle on low-power devices.
+  repulsionFrameCounter++;
+  if (repulsionFrameCounter >= REPULSION_SKIP_FRAMES) {
+    repulsionFrameCounter = 0;
+    if (!isSyncing) {
+      try { simulateRepulsion(); } catch (e) { /* ignore runtime errors */ }
+    }
+  } else {
+    // still update some subtle motion on skipped frames if needed (lightweight)
+    if (!isSyncing) {
+      for (let d of electronDomains) {
+        if (!d.tangentOffset) d.tangentOffset = createVector(0,0,0);
+        d.tangentOffset.mult(TANGENT_DAMP);
+      }
+    }
   }
 
   // Draw lone pair ovals last so they overlay nicely
@@ -2914,7 +3508,7 @@ dom.baseDir = dir.copy();
     }
   }
 
-  // Update simple UI panels (safe-guarded)
+  // Update simple UI panels (safe-guarded, throttled)
   try { updateDomainListUI(); } catch (e) {}
   try { updateFormulaFromState(); } catch (e) {}
 }
