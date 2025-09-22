@@ -73,6 +73,11 @@ let RENDER_ANGLE_LABELS = !isMobileDevice; // skip angle labels on many mobiles 
 let repulsionFrameCounter = 0;
 let lastUIUpdateTime = 0;
 
+/////////////////////// Smooth zoom helpers ///////////////////////
+let targetZoom = 1.0;
+let ZOOM_LERP = isMobileDevice ? 0.12 : 0.22; // smoother on mobile
+let lastTouchDist = 0;
+
 /////////////////////// Utility: client <-> world coordinate conversion ///////////////////////
 function clientToWorld(clientX, clientY) {
   if (!p5Canvas || !p5Canvas.elt) {
@@ -680,7 +685,7 @@ class ElectronDomain {
       rotateX(-rotationX);
       translate(0, -BOND_SPHERE_RADIUS - 12, 1.6);
       textFont(arialFont);
-      textSize(14);
+      textSize(isMobileDevice ? 12 : 14);
       textAlign(CENTER, CENTER);
       noStroke();
       fill(255);
@@ -766,7 +771,7 @@ class LonePair extends ElectronDomain {
       let verticalOffset = - (BOND_SPHERE_RADIUS * 1.6 + 12);
       translate(0, verticalOffset, 1.6);
       textFont(arialFont);
-      textSize(14);
+      textSize(isMobileDevice ? 12 : 14);
       textAlign(CENTER, CENTER);
       noStroke();
       fill(255);
@@ -821,7 +826,7 @@ class PresetDomain {
       rotateX(-rotationX);
       translate(0, -BOND_SPHERE_RADIUS - 10, 2.2);
       textFont(arialFont);
-      textSize(13);
+      textSize(isMobileDevice ? 12 : 13);
       textAlign(CENTER, CENTER);
       noStroke();
       fill(255);
@@ -855,7 +860,7 @@ class PresetDomain {
       let verticalOffset = - (BOND_SPHERE_RADIUS * 1.6 + 12);
       translate(0, verticalOffset, 1.6);
       textFont(arialFont);
-      textSize(12);
+      textSize(isMobileDevice ? 12 : 12);
       textAlign(CENTER, CENTER);
       noStroke();
       fill(255);
@@ -1060,6 +1065,11 @@ function computePresetBondRoles(visual) {
   return roles;
 }
 
+/////////////////////// UNIQUE-FAN RADIUS HELPERS (grid-based nearest-slot) ///////////////////////
+// This is used by preset molecules (kept as earlier behavior): it finds the nearest grid slot
+// to the requested base radius that does not conflict with already-used radii (min spacing 20px).
+// [Function defined earlier]
+
 /////////////////////// DRAW / UI RESET HELPER ///////////////////////
 // Restore angle overlay & auto-rotate toggles to the initial runtime state's values.
 // This is used when adding/removing domains via the UI in the top-right so the two toggles
@@ -1102,7 +1112,7 @@ function drawPresetMolecule() {
     rotateX(-rotationX);
     translate(0, -CENTRAL_ATOM_RADIUS - 18, 2.8);
     textFont(arialFont);
-    textSize(14);
+    textSize(isMobileDevice ? 14 : 14);
     textAlign(CENTER, CENTER);
     noStroke();
     fill(255);
@@ -1230,6 +1240,9 @@ function placeLabelNonOverlapping(worldPos, dir, existingScreens, minPx = 28) {
 
   const baseStep = 18;
   const maxLateralAttempts = 12;
+  // reduce spacing a bit on mobile to help labels fit
+  const minPxAdj = isMobileDevice ? Math.max(18, minPx - 8) : minPx;
+
   for (let attempt = 0; attempt < maxLateralAttempts; attempt++) {
     let distIdx = Math.ceil((attempt + 1) / 2);
     let side = (attempt % 2 === 0) ? 1 : -1;
@@ -1241,7 +1254,7 @@ function placeLabelNonOverlapping(worldPos, dir, existingScreens, minPx = 28) {
     for (let p of existingScreens) {
       let dx = screenCandidate.x - p.x;
       let dy = screenCandidate.y - p.y;
-      if (dx*dx + dy*dy < minPx*minPx) { ok = false; break; }
+      if (dx*dx + dy*dy < minPxAdj*minPxAdj) { ok = false; break; }
     }
     if (ok) {
       existingScreens.push({ x: screenCandidate.x, y: screenCandidate.y });
@@ -1263,7 +1276,7 @@ function placeLabelNonOverlapping(worldPos, dir, existingScreens, minPx = 28) {
     for (let p of existingScreens) {
       let dx = sx - p.x;
       let dy = sy - p.y;
-      if (dx*dx + dy*dy < minPx*minPx) { ok = false; break; }
+      if (dx*dx + dy*dy < minPxAdj*minPxAdj) { ok = false; break; }
     }
     if (ok) {
       existingScreens.push({x: sx, y: sy});
@@ -2922,6 +2935,32 @@ function createUI() {
       }
     }
   }, { passive: true });
+
+  // Touch handling for smooth pinch-zoom on mobile:
+  if (isMobileDevice && p5Canvas && p5Canvas.elt) {
+    let elt = p5Canvas.elt;
+    elt.addEventListener('touchstart', (ev) => {
+      if (ev.touches && ev.touches.length === 2) {
+        lastTouchDist = Math.hypot(ev.touches[0].clientX - ev.touches[1].clientX, ev.touches[0].clientY - ev.touches[1].clientY);
+      }
+    }, { passive: true });
+    elt.addEventListener('touchmove', (ev) => {
+      if (ev.touches && ev.touches.length === 2) {
+        let d = Math.hypot(ev.touches[0].clientX - ev.touches[1].clientX, ev.touches[0].clientY - ev.touches[1].clientY);
+        if (lastTouchDist > 0) {
+          let delta = d - lastTouchDist;
+          // map pixel delta to zoom change
+          targetZoom += delta * 0.0025;
+          targetZoom = constrain(targetZoom, 0.3, 12.0);
+        }
+        lastTouchDist = d;
+        ev.preventDefault();
+      }
+    }, { passive: false });
+    elt.addEventListener('touchend', (ev) => {
+      lastTouchDist = 0;
+    }, { passive: true });
+  }
 }
 
 function toggleNotesModal() {
@@ -2999,8 +3038,10 @@ function setDragButtonsEnabled(enabled) {
 }
 
 function mouseWheel(event) {
-  zoom -= event.deltaY * 0.0012;
-  zoom = constrain(zoom, 0.3, 12.0);
+  // smoother on mobile by setting targetZoom and lerping in draw()
+  targetZoom -= event.deltaY * 0.0012;
+  targetZoom = constrain(targetZoom, 0.3, 12.0);
+  // prevent default page scroll
   return false;
 }
 
@@ -3089,6 +3130,7 @@ function updatePreviewDomain() {
   } else popCompleteTime = 0;
 }
 
+/////////////////////// Bond role helpers for presets ///////////////////////
 function computeBondRoles() {
   let roles = new Array(electronDomains.length).fill('other');
   if (!selectedMolecule) return roles;
@@ -3271,7 +3313,7 @@ function drawCentralLabel() {
   rotateX(-rotationX);
   translate(0, -CENTRAL_ATOM_RADIUS - 14, 1.6);
   textFont(arialFont);
-  textSize(16);
+  textSize(isMobileDevice ? 14 : 16);
   textAlign(CENTER, CENTER);
   noStroke();
   fill(255);
@@ -3328,6 +3370,8 @@ function windowResized() {
 }
 
 function draw() {
+  // Smoothly lerp zoom toward targetZoom for a nicer mobile feel
+  zoom = lerp(zoom, targetZoom, ZOOM_LERP);
   background(0);
   // Simplify lights on mobile for performance
   ambientLight(40);
