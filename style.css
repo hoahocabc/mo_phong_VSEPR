@@ -37,7 +37,7 @@ canvas {
   position: absolute;
   top: 0;
   bottom: 0;
-  width: 260px; /* Chiều rộng cố định trên Desktop */
+  width: 210px; /* Đã thu hẹp từ 260px xuống 210px */
   background: rgba(20, 20, 20, 0.85); /* Nền tối kính mờ */
   backdrop-filter: blur(12px);
   -webkit-backdrop-filter: blur(12px);

@@ -92,7 +92,8 @@ let ANGLE_STEPS = isMobileDevice ? 24 : 64;
 let REPULSION_SKIP_FRAMES = isMobileDevice ? 3 : 1;
 let UI_UPDATE_INTERVAL = isMobileDevice ? 300 : 80;
 let INITIAL_RELAX_ITERS = isMobileDevice ? 3 : 6;
-let RENDER_ANGLE_LABELS = !isMobileDevice;
+// FIX: Always render angle labels if asked
+let RENDER_ANGLE_LABELS = true; 
 
 let repulsionFrameCounter = 0;
 let lastUIUpdateTime = 0;
@@ -2691,6 +2692,16 @@ function createUI() {
   rightHost.elt.addEventListener('click', (e) => {
     if (e.target === rightHost.elt) togglePanel(rightHost, leftHost);
   });
+  
+  // FIX: Global listener to close sidebars when clicking outside (on the canvas)
+  window.addEventListener('click', (e) => {
+    if (window.innerWidth > 900) return;
+    // Check if click target is NOT inside left or right panel
+    if (!e.target.closest('#left-panel') && !e.target.closest('#right-panel')) {
+         select("#left-panel").removeClass('expanded');
+         select("#right-panel").removeClass('expanded');
+    }
+  });
 
   // Sidebar brand labels
   const brandBox = createDiv();
@@ -2739,8 +2750,7 @@ function createUI() {
       clearSelectedMolecule();
     } else applyMolecule(val);
     
-    // Tự đóng panel trên mobile sau khi chọn
-    if(window.innerWidth <= 900) leftHost.removeClass('expanded');
+    // FIX: Removed auto-closing panel on mobile
   });
 
   angleToggleBtn = createButton(
@@ -2847,8 +2857,7 @@ function createUI() {
         draggedElementType = type;
         ghostWorld = clientToWorld(cx, cy);
 
-        // Đóng panel trên mobile khi bắt đầu kéo
-        if(window.innerWidth <= 900) rightHost.removeClass('expanded');
+        // FIX: Removed auto-closing panel on mobile
     };
 
     b.elt.addEventListener("mousedown", (e) => {
@@ -3052,7 +3061,13 @@ function mouseWheel(event) {
 }
 
 function mouseDragged(event) {
-  if (pointerOverSidebar) return true;
+  // FIX: If user is dragging on the canvas, allow it regardless of pointerOverSidebar flag which might be sticky
+  if (event && event.target === p5Canvas.elt) {
+     // Allow
+  } else if (pointerOverSidebar) {
+     return true;
+  }
+  
   if (orientActive) {
     orientActive = false;
     if (autoRotateSuspendedDuringOrient) {
@@ -3470,7 +3485,10 @@ function applySceneLights(scale = 1) {
     pointLight(80 * scale, 80 * scale, 80 * scale, -400, -400, -600);
     directionalLight(140 * scale, 140 * scale, 140 * scale, 0.5, 0.5, -1);
   } else {
+    // FIX: Tăng sáng cho mobile
+    ambientLight(100 * scale);
     pointLight(160 * scale, 160 * scale, 160 * scale, 300, 300, 400);
+    directionalLight(200 * scale, 200 * scale, 200 * scale, 0.5, 0.5, -1);
   }
 }
 
