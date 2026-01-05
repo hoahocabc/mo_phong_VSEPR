@@ -19,11 +19,11 @@ function preload() {
 
 /* ---------- Text helpers: 3D Billboarding ---------- */
 
-// Hàm vẽ nhãn 3D luôn hướng về camera và nằm giữa đối tượng
-// radiusOffset: khoảng cách đẩy chữ ra khỏi tâm (thường bằng bán kính quả cầu) để chữ hiện lên bề mặt
+// Tối ưu hóa: Chỉ vẽ nhãn khi thực sự cần thiết và giảm độ phức tạp
 function drawLabelText(worldPos, txt, baseSize = 20, radiusOffset = 0, colorVal = 30) {
   if (!arialFont || !txt || !worldPos || !showObjectLabels) return;
 
+  // Culling đơn giản: Nếu ở quá xa hoặc khuất, có thể bỏ qua (đơn giản hóa ở đây là luôn vẽ nhưng check labels toggle)
   push();
   translate(worldPos.x, worldPos.y, worldPos.z);
 
@@ -78,25 +78,29 @@ function safeLerpVec(a, b, t) {
 }
 
 /////////////////////// Performance / Quality adaptive settings ///////////////////////
+// CẢI TIẾN: Phát hiện thiết bị tốt hơn và giảm cài đặt thấp hơn nữa cho mobile
 let isMobileDevice =
   (typeof navigator !== "undefined" &&
     /Mobi|Android|iPhone|iPad|iPod|Windows Phone/i.test(navigator.userAgent)) ||
   (typeof window !== "undefined" &&
     "ontouchstart" in window &&
     navigator.maxTouchPoints &&
-    navigator.maxTouchPoints > 1);
+    navigator.maxTouchPoints > 1) || (window.innerWidth < 800);
 
-let PIXEL_DENSITY = isMobileDevice ? 1 : Math.min(window.devicePixelRatio || 1, 2);
-let SPHERE_DETAIL = isMobileDevice ? 20 : 60;
-let OVAL_DETAIL_X = isMobileDevice ? 18 : 56;
-let OVAL_DETAIL_Y = isMobileDevice ? 18 : 56;
-let CYL_DETAIL = isMobileDevice ? 10 : 28;
-// Mịn cung góc hơn
-let ANGLE_STEPS = isMobileDevice ? 24 : 64;
-let REPULSION_SKIP_FRAMES = isMobileDevice ? 3 : 1;
-let UI_UPDATE_INTERVAL = isMobileDevice ? 300 : 80;
+// CẢI TIẾN: Pixel density 1 cho mobile là bắt buộc để giữ FPS cao
+let PIXEL_DENSITY = isMobileDevice ? 1 : Math.min(window.devicePixelRatio || 1, 1.5);
+
+// CẢI TIẾN: Giảm mạnh độ chi tiết hình học trên mobile
+let SPHERE_DETAIL = isMobileDevice ? 12 : 40; // Giảm từ 20/60 xuống 12/40
+let OVAL_DETAIL_X = isMobileDevice ? 12 : 40;
+let OVAL_DETAIL_Y = isMobileDevice ? 12 : 40;
+let CYL_DETAIL = isMobileDevice ? 8 : 24; // Giảm từ 10/28 xuống 8/24
+
+let ANGLE_STEPS = isMobileDevice ? 12 : 48; // Giảm bước vẽ góc
+let REPULSION_SKIP_FRAMES = isMobileDevice ? 2 : 1; // Tính toán vật lý ít thường xuyên hơn
+let UI_UPDATE_INTERVAL = isMobileDevice ? 500 : 100; // Cập nhật UI chậm hơn
 let INITIAL_RELAX_ITERS = isMobileDevice ? 3 : 6;
-let RENDER_ANGLE_LABELS = !isMobileDevice;
+let RENDER_ANGLE_LABELS = !isMobileDevice; // Tắt label góc trên mobile cho thoáng
 
 let repulsionFrameCounter = 0;
 let lastUIUpdateTime = 0;
@@ -222,7 +226,8 @@ function drawCylinderBetween(p1, p2, radius = 4, detail = CYL_DETAIL) {
     rotate(PI, createVector(1, 0, 0));
   }
   noStroke();
-  cylinder(radius, len, detail, 1, true, true);
+  // CẢI TIẾN: Bỏ nắp trên dưới cylinder để tiết kiệm polygons vì chúng thường bị che
+  cylinder(radius, len, detail, 1, false, false); 
   pop();
 }
 
@@ -290,7 +295,7 @@ let syncDuration = 700;
 let syncInitialDirs = [];
 let syncTargetDirs = [];
 
-let visualScale = 1.35;
+let visualScale = isMobileDevice ? 1.0 : 1.35; // Giảm scale mặc định trên mobile để dễ nhìn
 let centralScale = 1.0;
 let centralSpawnTime = 0;
 const CENTRAL_SPAWN_DURATION = 700;
@@ -328,9 +333,9 @@ const I18N = {
     auto_off: "Bật xoay",
     labels_on: "Tắt nhãn",
     labels_off: "Bật nhãn",
-    screenshot: "Chụp ảnh 4K",
+    screenshot: "Chụp ảnh", // Rút gọn cho mobile
     reset: "Reset",
-    molecule_placeholder: "Phân tử thật",
+    molecule_placeholder: "Phân tử mẫu",
     notes: "Ghi chú",
     topLabel: "MÔ PHỎNG VSEPR",
     notesContent: `* Trong công thức AXₙEₘ: 
@@ -357,7 +362,7 @@ const I18N = {
     auto_off: "Auto rotate",
     labels_on: "Hide labels",
     labels_off: "Show labels",
-    screenshot: "Capture 4K",
+    screenshot: "Capture",
     reset: "Reset",
     molecule_placeholder: "Real molecules",
     notes: "Notes",
@@ -1011,6 +1016,7 @@ class PresetDomain {
     translate(ovalPos.x, ovalPos.y, ovalPos.z);
     alignZ_with_roll_fix(axisOut);
 
+    // CẢI TIẾN: Giảm ánh sáng động để tăng hiệu năng trên mobile
     noLights();
     noStroke();
     fill(200, 190, 170);
@@ -1027,10 +1033,8 @@ class PresetDomain {
 
     pop();
 
-    ambientLight(40);
-    pointLight(160, 160, 160, 400, 400, 600);
-    pointLight(80, 80, 80, -400, -400, -600);
-    directionalLight(140, 140, 140, 0.5, 0.5, -1);
+    // Khôi phục ánh sáng cơ bản
+    applySceneLights(1);
   }
 
   displayPresetBond(centerPos) {
@@ -2831,6 +2835,53 @@ function createUI() {
       };
       window.addEventListener("mouseup", onGlobalMouseUp, { passive: true });
     });
+    
+    // CẢI TIẾN: Thêm xử lý touch cho nút kéo thả
+    b.elt.addEventListener("touchstart", (e) => {
+      if (selectedMolecule) {
+        e.preventDefault();
+        return;
+      }
+      e.preventDefault(); // Ngăn scroll
+      if (e.touches.length > 0) {
+        const touch = e.touches[0];
+        if (orientActive) {
+          orientActive = false;
+          if (autoRotateSuspendedDuringOrient) {
+            autoRotate = true;
+            autoRotateSuspendedDuringOrient = false;
+          }
+        }
+
+        isDragging = true;
+        draggedElementType = type;
+        ghostWorld = clientToWorld(touch.clientX, touch.clientY);
+
+        // Listener tạm thời cho touchmove toàn cục
+        const touchMoveHandler = (tmEv) => {
+             if (!isDragging) return;
+             const t = tmEv.touches[0];
+             ghostWorld = clientToWorld(t.clientX, t.clientY);
+             tmEv.preventDefault();
+        };
+
+        const touchEndHandler = (teEv) => {
+             // Lấy vị trí touch cuối cùng
+             if (teEv.changedTouches.length > 0) {
+                 const t = teEv.changedTouches[0];
+                 endDragAtClientCoords(t.clientX, t.clientY);
+             } else {
+                 isDragging = false;
+             }
+             window.removeEventListener('touchmove', touchMoveHandler);
+             window.removeEventListener('touchend', touchEndHandler);
+        };
+        
+        window.addEventListener("touchmove", touchMoveHandler, { passive: false });
+        window.addEventListener("touchend", touchEndHandler, { passive: false });
+      }
+    }, {passive: false});
+
     return b;
   }
 
@@ -3408,21 +3459,31 @@ function endCapture() {
 /* ---------- Lighting helper ---------- */
 function applySceneLights(scale = 1) {
   ambientLight(40 * scale);
+  // CẢI TIẾN: Giảm bớt số lượng đèn trên mobile để tăng FPS
   if (!isMobileDevice) {
     pointLight(160 * scale, 160 * scale, 160 * scale, 400, 400, 600);
     pointLight(80 * scale, 80 * scale, 80 * scale, -400, -400, -600);
     directionalLight(140 * scale, 140 * scale, 140 * scale, 0.5, 0.5, -1);
   } else {
+    // Mobile chỉ dùng 1 đèn point
     pointLight(160 * scale, 160 * scale, 160 * scale, 300, 300, 400);
   }
 }
 
 function setup() {
+  // CẢI TIẾN: Tắt antialias trên mobile vì màn hình dpi cao đã đủ mịn, tăng hiệu năng đáng kể
   try {
-    setAttributes("antialias", true);
+    if (!isMobileDevice) {
+       setAttributes("antialias", true);
+    } else {
+       setAttributes("antialias", false);
+    }
   } catch (e) {}
-  PIXEL_DENSITY = isMobileDevice ? 1 : Math.min(window.devicePixelRatio || 1, 2);
+  
+  // CẢI TIẾN: Pixel density 1 cho mobile để tránh render 4x pixels
+  PIXEL_DENSITY = isMobileDevice ? 1 : Math.min(window.devicePixelRatio || 1, 1.5);
   pixelDensity(PIXEL_DENSITY);
+  
   const { w, h } = getCanvasSize();
   p5Canvas = createCanvas(w, h, WEBGL);
   p5Canvas.parent("canvas-container");
