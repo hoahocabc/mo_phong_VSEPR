@@ -19,15 +19,14 @@ function preload() {
 
 /* ---------- Text helpers: 3D Billboarding ---------- */
 
-// Tối ưu hóa: Chỉ vẽ nhãn khi thực sự cần thiết và giảm độ phức tạp
+// Hàm vẽ nhãn 3D luôn hướng về camera và nằm giữa đối tượng
 function drawLabelText(worldPos, txt, baseSize = 20, radiusOffset = 0, colorVal = 30) {
   if (!arialFont || !txt || !worldPos || !showObjectLabels) return;
 
-  // Culling đơn giản: Nếu ở quá xa hoặc khuất, có thể bỏ qua (đơn giản hóa ở đây là luôn vẽ nhưng check labels toggle)
   push();
   translate(worldPos.x, worldPos.y, worldPos.z);
 
-  // Billboarding
+  // Billboarding: xoay ngược lại với camera để chữ luôn hướng về người xem
   rotateZ(-rotationZ);
   rotateY(-rotationY);
   rotateX(-rotationX);
@@ -78,29 +77,22 @@ function safeLerpVec(a, b, t) {
 }
 
 /////////////////////// Performance / Quality adaptive settings ///////////////////////
-// CẢI TIẾN: Phát hiện thiết bị tốt hơn và giảm cài đặt thấp hơn nữa cho mobile
 let isMobileDevice =
   (typeof navigator !== "undefined" &&
     /Mobi|Android|iPhone|iPad|iPod|Windows Phone/i.test(navigator.userAgent)) ||
-  (typeof window !== "undefined" &&
-    "ontouchstart" in window &&
-    navigator.maxTouchPoints &&
-    navigator.maxTouchPoints > 1) || (window.innerWidth < 800);
+  (typeof window !== "undefined" && window.innerWidth <= 900);
 
-// CẢI TIẾN: Pixel density 1 cho mobile là bắt buộc để giữ FPS cao
 let PIXEL_DENSITY = isMobileDevice ? 1 : Math.min(window.devicePixelRatio || 1, 1.5);
-
-// CẢI TIẾN: Giảm mạnh độ chi tiết hình học trên mobile
-let SPHERE_DETAIL = isMobileDevice ? 12 : 40; // Giảm từ 20/60 xuống 12/40
-let OVAL_DETAIL_X = isMobileDevice ? 12 : 40;
-let OVAL_DETAIL_Y = isMobileDevice ? 12 : 40;
-let CYL_DETAIL = isMobileDevice ? 8 : 24; // Giảm từ 10/28 xuống 8/24
-
-let ANGLE_STEPS = isMobileDevice ? 12 : 48; // Giảm bước vẽ góc
-let REPULSION_SKIP_FRAMES = isMobileDevice ? 2 : 1; // Tính toán vật lý ít thường xuyên hơn
-let UI_UPDATE_INTERVAL = isMobileDevice ? 500 : 100; // Cập nhật UI chậm hơn
+let SPHERE_DETAIL = isMobileDevice ? 20 : 60;
+let OVAL_DETAIL_X = isMobileDevice ? 18 : 56;
+let OVAL_DETAIL_Y = isMobileDevice ? 18 : 56;
+let CYL_DETAIL = isMobileDevice ? 10 : 28;
+// Mịn cung góc hơn
+let ANGLE_STEPS = isMobileDevice ? 24 : 64;
+let REPULSION_SKIP_FRAMES = isMobileDevice ? 3 : 1;
+let UI_UPDATE_INTERVAL = isMobileDevice ? 300 : 80;
 let INITIAL_RELAX_ITERS = isMobileDevice ? 3 : 6;
-let RENDER_ANGLE_LABELS = !isMobileDevice; // Tắt label góc trên mobile cho thoáng
+let RENDER_ANGLE_LABELS = !isMobileDevice;
 
 let repulsionFrameCounter = 0;
 let lastUIUpdateTime = 0;
@@ -111,15 +103,17 @@ let ZOOM_LERP = isMobileDevice ? 0.1 : 0.22;
 let lastTouchDist = 0;
 
 /////////////////////// Utility: client <-> world coordinate conversion ///////////////////////
+// Đã sửa lại để sử dụng getBoundingClientRect chính xác cho việc căn giữa
 function clientToWorld(clientX, clientY) {
   if (!p5Canvas || !p5Canvas.elt) {
-    let x = clientX - (window.innerWidth / 2 || width / 2);
-    let y = clientY - (window.innerHeight / 2 || height / 2);
+    let x = clientX - width / 2;
+    let y = clientY - height / 2;
     return createVector(x / (zoom * visualScale), y / (zoom * visualScale), 0);
   }
   let rect = p5Canvas.elt.getBoundingClientRect();
   let cx = clientX - rect.left;
   let cy = clientY - rect.top;
+  // Gốc tọa độ WEBGL (0,0) nằm ở chính giữa Canvas
   let x = cx - rect.width / 2;
   let y = cy - rect.height / 2;
   return createVector(x / (zoom * visualScale), y / (zoom * visualScale), 0);
@@ -226,8 +220,7 @@ function drawCylinderBetween(p1, p2, radius = 4, detail = CYL_DETAIL) {
     rotate(PI, createVector(1, 0, 0));
   }
   noStroke();
-  // CẢI TIẾN: Bỏ nắp trên dưới cylinder để tiết kiệm polygons vì chúng thường bị che
-  cylinder(radius, len, detail, 1, false, false); 
+  cylinder(radius, len, detail, 1, true, true);
   pop();
 }
 
@@ -295,7 +288,7 @@ let syncDuration = 700;
 let syncInitialDirs = [];
 let syncTargetDirs = [];
 
-let visualScale = isMobileDevice ? 1.0 : 1.35; // Giảm scale mặc định trên mobile để dễ nhìn
+let visualScale = isMobileDevice ? 0.95 : 1.35;
 let centralScale = 1.0;
 let centralSpawnTime = 0;
 const CENTRAL_SPAWN_DURATION = 700;
@@ -333,9 +326,9 @@ const I18N = {
     auto_off: "Bật xoay",
     labels_on: "Tắt nhãn",
     labels_off: "Bật nhãn",
-    screenshot: "Chụp ảnh", // Rút gọn cho mobile
+    screenshot: "Chụp ảnh 4K",
     reset: "Reset",
-    molecule_placeholder: "Phân tử mẫu",
+    molecule_placeholder: "Phân tử thật",
     notes: "Ghi chú",
     topLabel: "MÔ PHỎNG VSEPR",
     notesContent: `* Trong công thức AXₙEₘ: 
@@ -362,7 +355,7 @@ const I18N = {
     auto_off: "Auto rotate",
     labels_on: "Hide labels",
     labels_off: "Show labels",
-    screenshot: "Capture",
+    screenshot: "Capture 4K",
     reset: "Reset",
     molecule_placeholder: "Real molecules",
     notes: "Notes",
@@ -1016,7 +1009,6 @@ class PresetDomain {
     translate(ovalPos.x, ovalPos.y, ovalPos.z);
     alignZ_with_roll_fix(axisOut);
 
-    // CẢI TIẾN: Giảm ánh sáng động để tăng hiệu năng trên mobile
     noLights();
     noStroke();
     fill(200, 190, 170);
@@ -1033,8 +1025,14 @@ class PresetDomain {
 
     pop();
 
-    // Khôi phục ánh sáng cơ bản
-    applySceneLights(1);
+    ambientLight(40);
+    if (!isMobileDevice) {
+      pointLight(160, 160, 160, 400, 400, 600);
+      pointLight(80, 80, 80, -400, -400, -600);
+      directionalLight(140, 140, 140, 0.5, 0.5, -1);
+    } else {
+      pointLight(160, 160, 160, 300, 300, 400);
+    }
   }
 
   displayPresetBond(centerPos) {
@@ -2667,6 +2665,33 @@ function createUI() {
   const rightHost = select("#right-panel");
   const canvasHost = select("#canvas-container");
 
+  // --- TỐI ƯU MOBILE: Logic đóng mở Panel ---
+  const togglePanel = (panel, otherPanel) => {
+    // Nếu màn hình lớn (>900px), không làm gì (giữ nguyên layout 3 cột)
+    if (window.innerWidth > 900) return;
+
+    // Mobile: Toggle class 'expanded'
+    if (panel.elt.classList.contains('expanded')) {
+       panel.removeClass('expanded');
+    } else {
+       if(otherPanel) otherPanel.removeClass('expanded');
+       panel.addClass('expanded');
+    }
+  };
+
+  // Click listener cho Left Panel (chỉ trên tiêu đề/vùng trống để đóng mở)
+  leftHost.elt.addEventListener('click', (e) => {
+    // Chỉ toggle khi click vào chính panel hoặc header, không phải vào control bên trong
+    if (e.target === leftHost.elt || e.target.closest('.sidebar-brand')) {
+        togglePanel(leftHost, rightHost);
+    }
+  });
+  
+  // Click listener cho Right Panel
+  rightHost.elt.addEventListener('click', (e) => {
+    if (e.target === rightHost.elt) togglePanel(rightHost, leftHost);
+  });
+
   // Sidebar brand labels
   const brandBox = createDiv();
   brandBox.parent(leftHost);
@@ -2713,6 +2738,9 @@ function createUI() {
     if (!val) {
       clearSelectedMolecule();
     } else applyMolecule(val);
+    
+    // Tự đóng panel trên mobile sau khi chọn
+    if(window.innerWidth <= 900) leftHost.removeClass('expanded');
   });
 
   angleToggleBtn = createButton(
@@ -2805,81 +2833,60 @@ function createUI() {
     let b = createButton(iconHTML);
     b.parent(rightUI);
     b.addClass("icon-button");
-    b.elt.addEventListener("mousedown", (e) => {
-      if (selectedMolecule) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault();
-
-      if (orientActive) {
-        orientActive = false;
-        if (autoRotateSuspendedDuringOrient) {
-          autoRotate = true;
-          autoRotateSuspendedDuringOrient = false;
+    
+    const startDrag = (cx, cy) => {
+        if (selectedMolecule) { return; }
+        if (orientActive) {
+            orientActive = false;
+            if (autoRotateSuspendedDuringOrient) {
+              autoRotate = true;
+              autoRotateSuspendedDuringOrient = false;
+            }
         }
-      }
+        isDragging = true;
+        draggedElementType = type;
+        ghostWorld = clientToWorld(cx, cy);
 
-      isDragging = true;
-      draggedElementType = type;
-      ghostWorld = clientToWorld(e.clientX, e.clientY);
+        // Đóng panel trên mobile khi bắt đầu kéo
+        if(window.innerWidth <= 900) rightHost.removeClass('expanded');
+    };
 
+    b.elt.addEventListener("mousedown", (e) => {
+      e.preventDefault();
+      startDrag(e.clientX, e.clientY);
+      
       onGlobalMouseMove = (ev) => {
         if (!isDragging) return;
         ghostWorld = clientToWorld(ev.clientX + (window.scrollX || 0), ev.clientY + (window.scrollY || 0));
       };
       window.addEventListener("mousemove", onGlobalMouseMove, { passive: true });
-
-      onGlobalMouseUp = (ev) => {
-        handleGlobalMouseUp(ev);
-      };
+      onGlobalMouseUp = (ev) => { handleGlobalMouseUp(ev); };
       window.addEventListener("mouseup", onGlobalMouseUp, { passive: true });
     });
     
-    // CẢI TIẾN: Thêm xử lý touch cho nút kéo thả
+    // Touch support for drag buttons
     b.elt.addEventListener("touchstart", (e) => {
-      if (selectedMolecule) {
-        e.preventDefault();
-        return;
-      }
-      e.preventDefault(); // Ngăn scroll
-      if (e.touches.length > 0) {
-        const touch = e.touches[0];
-        if (orientActive) {
-          orientActive = false;
-          if (autoRotateSuspendedDuringOrient) {
-            autoRotate = true;
-            autoRotateSuspendedDuringOrient = false;
-          }
-        }
-
-        isDragging = true;
-        draggedElementType = type;
-        ghostWorld = clientToWorld(touch.clientX, touch.clientY);
-
-        // Listener tạm thời cho touchmove toàn cục
-        const touchMoveHandler = (tmEv) => {
-             if (!isDragging) return;
-             const t = tmEv.touches[0];
-             ghostWorld = clientToWorld(t.clientX, t.clientY);
-             tmEv.preventDefault();
-        };
-
-        const touchEndHandler = (teEv) => {
-             // Lấy vị trí touch cuối cùng
-             if (teEv.changedTouches.length > 0) {
-                 const t = teEv.changedTouches[0];
-                 endDragAtClientCoords(t.clientX, t.clientY);
-             } else {
-                 isDragging = false;
-             }
-             window.removeEventListener('touchmove', touchMoveHandler);
-             window.removeEventListener('touchend', touchEndHandler);
-        };
-        
-        window.addEventListener("touchmove", touchMoveHandler, { passive: false });
-        window.addEventListener("touchend", touchEndHandler, { passive: false });
-      }
+       if(e.touches.length > 0) {
+           e.preventDefault();
+           let t = e.touches[0];
+           startDrag(t.clientX, t.clientY);
+           
+           const touchMove = (ev) => {
+              if(!isDragging) return;
+              let tm = ev.touches[0];
+              ghostWorld = clientToWorld(tm.clientX, tm.clientY);
+           };
+           const touchEnd = (ev) => {
+              if(isDragging && ev.changedTouches.length > 0) {
+                  let te = ev.changedTouches[0];
+                  endDragAtClientCoords(te.clientX, te.clientY);
+              }
+              window.removeEventListener('touchmove', touchMove);
+              window.removeEventListener('touchend', touchEnd);
+           };
+           window.addEventListener('touchmove', touchMove, {passive:false});
+           window.addEventListener('touchend', touchEnd, {passive:false});
+       }
     }, {passive: false});
 
     return b;
@@ -3411,14 +3418,13 @@ function clearSelectedMolecule() {
 /* =========================================================== */
 
 /////////////////////// Canvas sizing helper ///////////////////////
+// Sửa lỗi: Lấy trực tiếp kích thước từ container thay vì tính toán thủ công
 function getCanvasSize() {
-  const left = document.getElementById("left-panel");
-  const right = document.getElementById("right-panel");
-  const lw = left ? left.offsetWidth : 0;
-  const rw = right ? right.offsetWidth : 0;
-  const w = window.innerWidth - lw - rw;
-  const h = window.innerHeight;
-  return { w: max(320, w), h: max(240, h) };
+  let container = document.getElementById("canvas-container");
+  if (container && container.clientWidth > 0) {
+    return { w: container.clientWidth, h: container.clientHeight };
+  }
+  return { w: window.innerWidth, h: window.innerHeight };
 }
 
 /* ---------- Screenshot helpers ---------- */
@@ -3459,31 +3465,21 @@ function endCapture() {
 /* ---------- Lighting helper ---------- */
 function applySceneLights(scale = 1) {
   ambientLight(40 * scale);
-  // CẢI TIẾN: Giảm bớt số lượng đèn trên mobile để tăng FPS
   if (!isMobileDevice) {
     pointLight(160 * scale, 160 * scale, 160 * scale, 400, 400, 600);
     pointLight(80 * scale, 80 * scale, 80 * scale, -400, -400, -600);
     directionalLight(140 * scale, 140 * scale, 140 * scale, 0.5, 0.5, -1);
   } else {
-    // Mobile chỉ dùng 1 đèn point
     pointLight(160 * scale, 160 * scale, 160 * scale, 300, 300, 400);
   }
 }
 
 function setup() {
-  // CẢI TIẾN: Tắt antialias trên mobile vì màn hình dpi cao đã đủ mịn, tăng hiệu năng đáng kể
   try {
-    if (!isMobileDevice) {
-       setAttributes("antialias", true);
-    } else {
-       setAttributes("antialias", false);
-    }
+    setAttributes("antialias", true);
   } catch (e) {}
-  
-  // CẢI TIẾN: Pixel density 1 cho mobile để tránh render 4x pixels
   PIXEL_DENSITY = isMobileDevice ? 1 : Math.min(window.devicePixelRatio || 1, 1.5);
   pixelDensity(PIXEL_DENSITY);
-  
   const { w, h } = getCanvasSize();
   p5Canvas = createCanvas(w, h, WEBGL);
   p5Canvas.parent("canvas-container");
